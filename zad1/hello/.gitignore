@@ -1,0 +1,6 @@
+.gdb_history
+peda-session-*
+*.o
+*.so
+hello-32
+hello-64
