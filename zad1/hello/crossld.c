@@ -1,8 +1,3 @@
-// czy crossld ma byc bezpiecznie wielowatkowo?
-// czy mozemy zalozyc istnienie SHT_DYNAMIC?
-// o co chodzi z wielokrotnymi definicjami DT_STRTAB i DT_PLTRELSZ?
-// munmap a co ze stosem? (moze sie rozszerzyc i zwezyc w trakcie wykonania)
-// jakie calling convention dla 32-bitowego i 64-bitowego kodu
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -15,48 +10,83 @@
 #include "crossld.h"
 
 
-extern uint8_t call_32bits_code_start;
-extern uint8_t call_32bits_code_end;
-extern uint8_t call_32bits_code;
-// int call_32bits_code(uint32_t entry_point, uint32_t new_stack);
+#define GUEST_STACK_SIZE (1024 * 1024 * 4)
+#define BREAKPOINT {__asm__ volatile (".byte 0xcc");} // todo remove
+
+
+extern uint8_t call_guest_code_start;
+extern uint8_t call_guest_code_end;
+extern uint8_t call_guest_code_exit;
+int call_guest_code(uint32_t entry_point, uint32_t new_stack);
+typedef int (*call_guest_code_t)(uint32_t, uint32_t);
+
+#define CALL_GUEST_SIZE (&call_guest_code_end - &call_guest_code_start)
+#define CALL_GUEST_EP_OFFSET ((uint8_t*)(&call_guest_code) - &call_guest_code_start)
+#define CALL_GUEST_EXIT_OFFSET (&call_guest_code_exit - &call_guest_code_start)
 
 extern uint8_t trampoline_32to64_start;
 extern uint8_t trampoline_32to64_end;
 extern uint8_t trampoline_32to64;
+extern uint8_t trampoline_32to64_func_ptr;
+extern uint8_t trampoline_32to64_code_ptr;
+extern uint8_t trampoline_32to64_required_stack_size;
+extern uint8_t trampoline_32to64_conv_args_ptr;
+extern uint8_t trampoline_32to64_conv_ret_val_ptr;
+
+#define TRAMPOLINE_SIZE (&trampoline_32to64_end - &trampoline_32to64_start)
+#define TRAMPOLINE_EP_OFFSET (&trampoline_32to64 - &trampoline_32to64_start)
+#define TRAMPOLINE_FUNC_PTR_OFFSET (&trampoline_32to64_func_ptr - &trampoline_32to64_start)
+#define TRAMPOLINE_CODE_PTR_OFFSET (&trampoline_32to64_code_ptr - &trampoline_32to64_start)
+#define TRAMPOLINE_REQUIRED_STACK_SIZE_OFFSET (&trampoline_32to64_required_stack_size - &trampoline_32to64_start)
+#define TRAMPOLINE_CONV_ARGS_PTR_OFFSET (&trampoline_32to64_conv_args_ptr - &trampoline_32to64_start)
+#define TRAMPOLINE_CONV_RET_VAL_PTR_OFFSET (&trampoline_32to64_conv_ret_val_ptr - &trampoline_32to64_start)
 
 
-struct unmap_args_t {
+typedef struct unmap_args {
     void *ptr;
     size_t len;
-};
+} unmap_args_t;
 
-struct {
-    struct unmap_args_t *unmap_args;
-    size_t unmap_args_cap;
-    size_t unmap_args_len;
-} g_call_context; // TODO make it local
+typedef struct mappings_info {
+    unmap_args_t *args;
+    size_t args_cap;
+    size_t args_len;
+} mappings_info_t;
+
+// todo rename?
+void init_new_mappings(mappings_info_t *minfo, size_t capacity);
+void add_new_mapping(mappings_info_t *minfo, unmap_args_t args);
+void clear_all_mappings(mappings_info_t *minfo, int *ret_code);
+
+typedef struct trampolines_info {
+    uint32_t base_addr;
+    const struct function *funcs;
+    size_t nfuncs;
+} trampolines_info_t;
+
+int generate_trampolines(trampolines_info_t *tinfo, mappings_info_t *minfo,
+    const struct function *funcs, int nfuncs);
+uint64_t calculate_required_stack_size(const struct function *fun);
+uint32_t get_trampoline(trampolines_info_t *tinfo, const char *sym_name);
+
+void convert_arguments(uint64_t *dst, uint32_t *src, struct function *fun);
+uint32_t convert_return_value(uint64_t value, struct function *fun);
+
+#define TRAMPOLINE_NOT_FOUND 0
+#define TRAMPOLINE_GENERATION_FAILED 1
+#define TRAMPOLINE_GENERATION_OK 0
+
+
+// todo rename vars
+// todo move declaration to beggining?
+// todo jak duzo argsow? dotykanie stron pamieci po kolei?
+// todo czy funcs args sa poprawne?
 
 
 int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
-    // tmp code
-    void *code = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
-    if (code == MAP_FAILED) {
-        exit(-1);
-    }
-    memcpy(code, &trampoline_32to64_start, &trampoline_32to64_end - &trampoline_32to64_start);
-    void *code2 = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
-    if (code2 == MAP_FAILED) {
-        exit(-1);
-    }
-    memcpy(code2, &call_32bits_code_start, &call_32bits_code_end - &call_32bits_code_start);
-    void *code2_offseted = code2 + (&call_32bits_code - &call_32bits_code_start);
-    // tmp code end
-
-    assert(g_call_context.unmap_args_len == 0);
-    assert(g_call_context.unmap_args_cap == 0);
-    assert(!g_call_context.unmap_args);
-    
-    int ret = -1;
+    mappings_info_t minfo = {0};
+    trampolines_info_t tinfo = {0};
+    int ret_code = -1;
 
     // open & map file
     int fd = open(fname, O_RDONLY);
@@ -96,9 +126,7 @@ int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
         goto exit2;
     }
 
-    g_call_context.unmap_args_cap = hdr->e_phnum + nfuncs; // todo +1 dla trampoliny dla _start, +1 dla trampoliny dla _end
-    g_call_context.unmap_args = (struct unmap_args_t*) malloc(
-        g_call_context.unmap_args_cap * sizeof(struct unmap_args_t));
+    init_new_mappings(&minfo, hdr->e_phnum + 1); // each segment + one mapping for trampolines
 
     int has_dyn_segment = 0;
     for (size_t i = 0; i < hdr->e_phnum; i++) {
@@ -127,9 +155,16 @@ int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
             (phdr->p_flags & PF_W ? PROT_WRITE : 0) |
             (phdr->p_flags & PF_R ? PROT_READ : 0);
         int flags = MAP_PRIVATE | MAP_32BIT | MAP_FIXED_NOREPLACE;
-        void *segm = mmap((void*) vaddr_start, page_offset + phdr->p_memsz,
+        size_t map_len = page_offset + phdr->p_memsz;
+        void *segm = mmap((void*) vaddr_start, map_len,
             prot, flags, fd, file_start);
+        
         if (segm == MAP_FAILED) {
+            goto exit3;
+        }
+        add_new_mapping(&minfo, (unmap_args_t) {.ptr = segm, .len = map_len});
+
+        if (segm != (void*)vaddr_start) {
             goto exit3;
         }
 
@@ -185,7 +220,6 @@ int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
                 jmp_rel_tab = (Elf32_Rel*)(uint64_t) dyn_it->d_un.d_ptr;
             }
         }
-         
         break;
     }
 
@@ -194,6 +228,10 @@ int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
     }
 
     // relocation
+    if (generate_trampolines(&tinfo, &minfo, funcs, nfuncs) != TRAMPOLINE_GENERATION_OK) {
+        goto exit3;
+    }
+
     if (has_dyn_section) {
         if (!sym_tab || !str_tab) {
             goto exit3;
@@ -208,11 +246,17 @@ int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
 
             for (const Elf32_Rel *rel = jmp_rel_tab; rel < jmp_rel_tab_end; rel++) {
                 const char* sym = str_tab + sym_tab[ELF32_R_SYM(rel->r_info)].st_name;
-                printf("Found sym: %s, offset=%p\n", sym, rel->r_offset);
                 switch(ELF32_R_TYPE(rel->r_info)) {
-                    case R_386_JMP_SLOT:
-                        *(Elf32_Word*)(uint64_t)(rel->r_offset) = (uint32_t)(uint64_t) code+(&trampoline_32to64 - &trampoline_32to64_start);//hdr->e_entry;//(Elf32_Word)0x24242424; // todo put trampoline here
+                    case R_386_JMP_SLOT: {
+                        uint32_t addr = get_trampoline(&tinfo, sym);
+                        if (addr != TRAMPOLINE_NOT_FOUND) {
+                            *(Elf32_Word*)(uint64_t)(rel->r_offset) = addr;
+                        }
+                        else {
+                            goto exit3;
+                        }
                         break;
+                    }
                     default:
                         break;
                 }
@@ -221,81 +265,196 @@ int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
     }
 
     // alloc stack
-    void *stack = mmap(NULL, page_size, PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_GROWSDOWN | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    void *stack = mmap(NULL, GUEST_STACK_SIZE, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
     if (stack == MAP_FAILED) {
         goto exit3;
     }
-    uint32_t stack32_top = (uint32_t)(uint64_t) (stack + page_size);
+    add_new_mapping(&minfo, (unmap_args_t) {.ptr = stack, .len = GUEST_STACK_SIZE});
+    uint32_t stack32_top = (uint32_t)(uint64_t) (stack + GUEST_STACK_SIZE);
 
     // call the actual 32 bit program
-    __asm__ volatile (".byte 0xcc");
-    //ret = call_32bits_code(hdr->e_entry, stack32_top);
-    ret = ((int(*)(uint32_t, uint32_t)) code2_offseted)(hdr->e_entry, stack32_top);
-
-    // todo dealloc stack (kinda tricky, since it grows)
+    uint32_t guest_ep = get_trampoline(&tinfo, "_start");
+    ret_code = ((call_guest_code_t)(uint64_t) guest_ep) (hdr->e_entry, stack32_top);
 
 exit3:
-    // todo add entries to this map! (mmap -> segment, functions)
-    for (size_t i = 0; i < g_call_context.unmap_args_len; i++) {
-        if (-1 == munmap(g_call_context.unmap_args[i].ptr, g_call_context.unmap_args[i].len)) {
-            ret = -1;
-        }
-    }
-    free(g_call_context.unmap_args);
-    memset(&g_call_context, 0, sizeof(g_call_context));
+    clear_all_mappings(&minfo, &ret_code);
 exit2:
     munmap(faddr, sb.st_size);
 exit1:
     close(fd);
 exit0:
-    return ret;
+    return ret_code;
 }
 
 
-_Noreturn void exit(int status) {
-    // todo
-    __builtin_unreachable();
+void init_new_mappings(mappings_info_t *minfo, size_t capacity) {
+    assert(minfo);
+    assert(minfo->args_cap == 0);
+    assert(capacity > 0);
+    
+    minfo->args_len = 0;
+    minfo->args_cap = capacity;
+    minfo->args = (unmap_args_t*) malloc(
+        minfo->args_cap * sizeof(unmap_args_t));
 }
 
-   /* __asm__ (
-            ".code32\n"
-            "__jmp_32_ep:\n"
-    		"pushl $0x2b;\n"
-            "popl %ds;\n"
-            "pushl $0x2b;\n"
-            "popl %es;\n"
-            "ret;\n"
+void add_new_mapping(mappings_info_t *minfo, unmap_args_t args) {
+    assert(minfo);
+    assert(minfo->args);
+    assert(minfo->args_len < minfo->args_cap);
 
-            ".code64\n"
-    );*/
+    minfo->args[minfo->args_len++] = args;
+}
 
-/*
-__asm__ (
-    ".code32\n"
-    "func_ptr:\n"
-        ".byte 0, 0, 0, 0\n"
+void clear_all_mappings(mappings_info_t *minfo, int *ret_code) {
+    assert(minfo);
+    assert(minfo->args);
 
-    "trampoline_32to64:\n"
-        "call 28(%eip)\n" // $__get_eip\n"
-    "__get_eip:\n"
-        "pop %eax\n"
-		"pushl $0x33\n"
-		//"pushl $trampoline_step2\n"
-		//"movl $trampoline_step2 - $trampoline_32to64, %eax\n"
-        //"pushl ($func_ptr)\n"
-		"lret\n"
-    ".code64\n"
-    "trampoline_step2:\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-);*/
+    for (size_t i = 0; i < minfo->args_len; i++) {
+        if (-1 == munmap(minfo->args[i].ptr, minfo->args[i].len)) {
+            *ret_code = -1;
+        }
+    }
+    free(minfo->args);
+    memset(minfo, 0, sizeof(minfo));
+}
+
+int generate_trampolines(trampolines_info_t *tinfo, mappings_info_t *minfo,
+        const struct function *funcs, int nfuncs) {
+    assert(tinfo);
+    assert(minfo);
+    assert(funcs);
+    assert(nfuncs > 0);
+    
+    // allocate memory
+    size_t trampolines_size = nfuncs * TRAMPOLINE_SIZE + CALL_GUEST_SIZE;
+    void *addr = mmap(NULL, trampolines_size, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+    if (addr == MAP_FAILED) {
+        return TRAMPOLINE_GENERATION_FAILED;
+    }
+    add_new_mapping(minfo, (unmap_args_t) {.ptr = addr, .len = trampolines_size});
+
+    tinfo->base_addr = (uint32_t)(uint64_t) addr;
+    tinfo->funcs = funcs;
+    tinfo->nfuncs = nfuncs;
+
+    // prepare trampolines
+    for (int i = 0; i < nfuncs; i++) {
+        void *elem_addr = addr + i * TRAMPOLINE_SIZE;
+        
+        memcpy(elem_addr, &trampoline_32to64_start, TRAMPOLINE_SIZE);
+        *(uint64_t*)(elem_addr + TRAMPOLINE_FUNC_PTR_OFFSET) = (uint64_t) &funcs[i];
+        *(uint64_t*)(elem_addr + TRAMPOLINE_CODE_PTR_OFFSET) = (uint64_t) funcs[i].code;
+        *(uint64_t*)(elem_addr + TRAMPOLINE_REQUIRED_STACK_SIZE_OFFSET) = calculate_required_stack_size(&funcs[i]);
+        *(uint64_t*)(elem_addr + TRAMPOLINE_CONV_ARGS_PTR_OFFSET) = (uint64_t) convert_arguments;
+        *(uint64_t*)(elem_addr + TRAMPOLINE_CONV_RET_VAL_PTR_OFFSET) = (uint64_t) convert_return_value;
+    }
+
+    // prepare _start & exit trampolines
+    memcpy(addr + nfuncs * TRAMPOLINE_SIZE, &call_guest_code_start, CALL_GUEST_SIZE);
+
+    // and make trampolines executable
+    if (mprotect(addr, trampolines_size, PROT_READ | PROT_EXEC) != 0) {
+        return TRAMPOLINE_GENERATION_FAILED;
+    }
+
+    return TRAMPOLINE_GENERATION_OK;
+}
+
+uint64_t calculate_required_stack_size(const struct function *fun) {
+    assert(fun);
+
+    uint64_t size = fun->nargs * 0x8;
+
+    // make sure to pad to at least 6 arguments/registers
+    if (size < 6 * 0x8) {
+        size = 6 * 0x8;
+    }
+    // and make sure the stack is aligned to 0 mod 16
+    else if (size & 0xF) {
+        size += 0x8;
+    }
+
+    return size;
+}
+
+uint32_t get_trampoline(trampolines_info_t *tinfo, const char *sym_name) {
+    assert(tinfo);
+    assert(sym_name);
+
+    if (strcmp(sym_name, "_start") == 0) {
+        return tinfo->base_addr + tinfo->nfuncs * TRAMPOLINE_SIZE + CALL_GUEST_EP_OFFSET;
+    }
+
+    if (strcmp(sym_name, "exit") == 0) {
+        return tinfo->base_addr + tinfo->nfuncs * TRAMPOLINE_SIZE + CALL_GUEST_EXIT_OFFSET;
+    }
+
+    for (size_t i = 0; i < tinfo->nfuncs; i++) {
+        if (strcmp(sym_name, tinfo->funcs[i].name) == 0) {
+            return tinfo->base_addr + TRAMPOLINE_SIZE * i + TRAMPOLINE_EP_OFFSET;
+        }
+    }
+
+    return TRAMPOLINE_NOT_FOUND;
+}
+
+// todo test this!
+void convert_arguments(uint64_t *dst, uint32_t *src, struct function *fun) {
+    for (int i = 0; i < fun->nargs; i++) {
+        switch (fun->args[i]) {
+            case TYPE_INT:
+            case TYPE_LONG:
+                *(int64_t*) dst = *(int32_t*) src;
+                break;
+            case TYPE_LONG_LONG:
+                *(int64_t*) dst = *(int64_t*) src;
+                src++;
+                break;
+            case TYPE_UNSIGNED_INT:
+            case TYPE_UNSIGNED_LONG:
+            case TYPE_PTR:
+                *dst = *src;
+                break;
+            case TYPE_UNSIGNED_LONG_LONG:
+                *dst = *(uint64_t*) src;
+                break;
+            default:
+                BREAKPOINT; // change to call exit(-1)
+                break;
+        }
+        dst++;
+        src++;
+    }
+}
+
+// todo test this
+uint32_t convert_return_value(uint64_t value, struct function *fun) {
+    return (uint32_t) value;
+
+    // switch (fun->result) {
+    //     case TYPE_VOID:
+    //         return 0;
+    //     case TYPE_INT:
+    //     case TYPE_LONG:
+    //         *(int64_t*) dst = *(int32_t*) src;
+    //         break;
+    //     case TYPE_LONG_LONG: // how? :O
+    //         *(int64_t*) dst = *(int64_t*) src;
+    //         src++;
+    //         break;
+    //     case TYPE_UNSIGNED_INT:
+    //     case TYPE_UNSIGNED_LONG:
+    //     case TYPE_PTR:
+    //         *dst = *src;
+    //         break;
+    //     case TYPE_UNSIGNED_LONG_LONG:
+    //         *dst = *(uint64_t*) src;
+    //         break;
+    //     default:
+    //         BREAKPOINT; // change to call exit(-1)
+    //         break;
+    // }
+}
