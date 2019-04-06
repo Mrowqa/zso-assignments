@@ -6,29 +6,35 @@
 #include <string.h>
 #include <assert.h>
 #include <stdlib.h>
-#include <stdio.h> // TODO remove
 #include "crossld.h"
 
 
 #define GUEST_STACK_SIZE (1024 * 1024 * 4)
-#define BREAKPOINT {__asm__ volatile (".byte 0xcc");} // todo remove
+//#define BREAKPOINT {__asm__ volatile (".byte 0xcc");} // todo remove
 
 
 extern uint8_t call_guest_code_start;
 extern uint8_t call_guest_code_end;
+extern uint8_t call_guest_code_start_rsp_storage_ptr;
 extern uint8_t call_guest_code_exit;
+void call_guest_code_exit_step2(int exit_code);
+typedef void (*call_guest_code_exit_t)(int);
 int call_guest_code(uint32_t entry_point, uint32_t new_stack);
 typedef int (*call_guest_code_t)(uint32_t, uint32_t);
 
 #define CALL_GUEST_SIZE (&call_guest_code_end - &call_guest_code_start)
-#define CALL_GUEST_EP_OFFSET ((uint8_t*)(&call_guest_code) - &call_guest_code_start)
+#define CALL_GUEST_RSP_STOR_PTR_OFFSET (&call_guest_code_start_rsp_storage_ptr - &call_guest_code_start)
 #define CALL_GUEST_EXIT_OFFSET (&call_guest_code_exit - &call_guest_code_start)
+#define CALL_GUEST_EXIT_STEP2_OFFSET ((uint8_t*)(&call_guest_code_exit_step2) - &call_guest_code_start)
+#define CALL_GUEST_EP_OFFSET ((uint8_t*)(&call_guest_code) - &call_guest_code_start)
+
 
 extern uint8_t trampoline_32to64_start;
 extern uint8_t trampoline_32to64_end;
 extern uint8_t trampoline_32to64;
 extern uint8_t trampoline_32to64_func_ptr;
 extern uint8_t trampoline_32to64_code_ptr;
+extern uint8_t trampoline_32to64_exit_step2_ptr;
 extern uint8_t trampoline_32to64_required_stack_size;
 extern uint8_t trampoline_32to64_conv_args_ptr;
 extern uint8_t trampoline_32to64_conv_ret_val_ptr;
@@ -37,6 +43,7 @@ extern uint8_t trampoline_32to64_conv_ret_val_ptr;
 #define TRAMPOLINE_EP_OFFSET (&trampoline_32to64 - &trampoline_32to64_start)
 #define TRAMPOLINE_FUNC_PTR_OFFSET (&trampoline_32to64_func_ptr - &trampoline_32to64_start)
 #define TRAMPOLINE_CODE_PTR_OFFSET (&trampoline_32to64_code_ptr - &trampoline_32to64_start)
+#define TRAMPOLINE_EXIT_STEP2_PTR_OFFSET (&trampoline_32to64_exit_step2_ptr - &trampoline_32to64_start)
 #define TRAMPOLINE_REQUIRED_STACK_SIZE_OFFSET (&trampoline_32to64_required_stack_size - &trampoline_32to64_start)
 #define TRAMPOLINE_CONV_ARGS_PTR_OFFSET (&trampoline_32to64_conv_args_ptr - &trampoline_32to64_start)
 #define TRAMPOLINE_CONV_RET_VAL_PTR_OFFSET (&trampoline_32to64_conv_ret_val_ptr - &trampoline_32to64_start)
@@ -65,12 +72,14 @@ typedef struct trampolines_info {
 } trampolines_info_t;
 
 int generate_trampolines(trampolines_info_t *tinfo, mappings_info_t *minfo,
-    const struct function *funcs, int nfuncs);
+    const struct function *funcs, int nfuncs, uint64_t *rsp_storage_ptr);
 uint64_t calculate_required_stack_size(const struct function *fun);
 uint32_t get_trampoline(trampolines_info_t *tinfo, const char *sym_name);
 
-void convert_arguments(uint64_t *dst, uint32_t *src, struct function *fun);
-uint32_t convert_return_value(uint64_t value, struct function *fun);
+void convert_arguments(uint64_t *dst, uint32_t *src, struct function *fun,
+    call_guest_code_exit_t exit_step2);
+uint32_t convert_return_value(uint64_t value, struct function *fun,
+    call_guest_code_exit_t exit_step2);
 
 #define TRAMPOLINE_NOT_FOUND 0
 #define TRAMPOLINE_GENERATION_FAILED 1
@@ -228,7 +237,9 @@ int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
     }
 
     // relocation
-    if (generate_trampolines(&tinfo, &minfo, funcs, nfuncs) != TRAMPOLINE_GENERATION_OK) {
+    uint64_t rsp_storage;
+    if (generate_trampolines(&tinfo, &minfo, funcs, nfuncs, &rsp_storage)
+            != TRAMPOLINE_GENERATION_OK) {
         goto exit3;
     }
 
@@ -321,7 +332,7 @@ void clear_all_mappings(mappings_info_t *minfo, int *ret_code) {
 }
 
 int generate_trampolines(trampolines_info_t *tinfo, mappings_info_t *minfo,
-        const struct function *funcs, int nfuncs) {
+        const struct function *funcs, int nfuncs, uint64_t *rsp_storage_ptr) {
     assert(tinfo);
     assert(minfo);
     assert(funcs);
@@ -341,19 +352,23 @@ int generate_trampolines(trampolines_info_t *tinfo, mappings_info_t *minfo,
     tinfo->nfuncs = nfuncs;
 
     // prepare trampolines
+    void *guest_code_start = addr + nfuncs * TRAMPOLINE_SIZE;
+    
     for (int i = 0; i < nfuncs; i++) {
         void *elem_addr = addr + i * TRAMPOLINE_SIZE;
         
         memcpy(elem_addr, &trampoline_32to64_start, TRAMPOLINE_SIZE);
         *(uint64_t*)(elem_addr + TRAMPOLINE_FUNC_PTR_OFFSET) = (uint64_t) &funcs[i];
         *(uint64_t*)(elem_addr + TRAMPOLINE_CODE_PTR_OFFSET) = (uint64_t) funcs[i].code;
+        *(uint64_t*)(elem_addr + TRAMPOLINE_EXIT_STEP2_PTR_OFFSET) = (uint64_t) guest_code_start + CALL_GUEST_EXIT_STEP2_OFFSET;
         *(uint64_t*)(elem_addr + TRAMPOLINE_REQUIRED_STACK_SIZE_OFFSET) = calculate_required_stack_size(&funcs[i]);
         *(uint64_t*)(elem_addr + TRAMPOLINE_CONV_ARGS_PTR_OFFSET) = (uint64_t) convert_arguments;
         *(uint64_t*)(elem_addr + TRAMPOLINE_CONV_RET_VAL_PTR_OFFSET) = (uint64_t) convert_return_value;
     }
 
     // prepare _start & exit trampolines
-    memcpy(addr + nfuncs * TRAMPOLINE_SIZE, &call_guest_code_start, CALL_GUEST_SIZE);
+    memcpy(guest_code_start, &call_guest_code_start, CALL_GUEST_SIZE);
+    *(uint64_t**)(guest_code_start + CALL_GUEST_RSP_STOR_PTR_OFFSET) = rsp_storage_ptr;
 
     // and make trampolines executable
     if (mprotect(addr, trampolines_size, PROT_READ | PROT_EXEC) != 0) {
@@ -402,7 +417,8 @@ uint32_t get_trampoline(trampolines_info_t *tinfo, const char *sym_name) {
 }
 
 // todo test this!
-void convert_arguments(uint64_t *dst, uint32_t *src, struct function *fun) {
+void convert_arguments(uint64_t *dst, uint32_t *src, struct function *fun,
+        call_guest_code_exit_t exit_step2) {
     for (int i = 0; i < fun->nargs; i++) {
         switch (fun->args[i]) {
             case TYPE_INT:
@@ -420,9 +436,10 @@ void convert_arguments(uint64_t *dst, uint32_t *src, struct function *fun) {
                 break;
             case TYPE_UNSIGNED_LONG_LONG:
                 *dst = *(uint64_t*) src;
+                src++;
                 break;
             default:
-                BREAKPOINT; // change to call exit(-1)
+                exit_step2(-1);
                 break;
         }
         dst++;
@@ -431,30 +448,31 @@ void convert_arguments(uint64_t *dst, uint32_t *src, struct function *fun) {
 }
 
 // todo test this
-uint32_t convert_return_value(uint64_t value, struct function *fun) {
-    return (uint32_t) value;
+uint32_t convert_return_value(uint64_t value, struct function *fun,
+        call_guest_code_exit_t exit_step2) {
+    int64_t signed_value = *((int64_t*) &value);
 
-    // switch (fun->result) {
-    //     case TYPE_VOID:
-    //         return 0;
-    //     case TYPE_INT:
-    //     case TYPE_LONG:
-    //         *(int64_t*) dst = *(int32_t*) src;
-    //         break;
-    //     case TYPE_LONG_LONG: // how? :O
-    //         *(int64_t*) dst = *(int64_t*) src;
-    //         src++;
-    //         break;
-    //     case TYPE_UNSIGNED_INT:
-    //     case TYPE_UNSIGNED_LONG:
-    //     case TYPE_PTR:
-    //         *dst = *src;
-    //         break;
-    //     case TYPE_UNSIGNED_LONG_LONG:
-    //         *dst = *(uint64_t*) src;
-    //         break;
-    //     default:
-    //         BREAKPOINT; // change to call exit(-1)
-    //         break;
-    // }
+    switch (fun->result) {
+        case TYPE_VOID:
+            return 0;
+        case TYPE_INT: // oh no, todo, int can't overflow
+        case TYPE_LONG:
+            if (signed_value < INT32_MIN || INT32_MAX < signed_value) {
+                exit_step2(-1);
+            }
+            return (uint32_t) value;
+        case TYPE_UNSIGNED_INT:
+        case TYPE_UNSIGNED_LONG:
+        case TYPE_PTR:
+            if (UINT32_MAX < value) {
+                exit_step2(-1);
+            }
+            return (uint32_t) value;
+        case TYPE_LONG_LONG:
+        case TYPE_UNSIGNED_LONG_LONG:
+            return value;
+        default:
+            exit_step2(-1);
+            break;
+    }
 }
