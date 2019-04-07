@@ -1,3 +1,5 @@
 *.tar
 prog-32
 prog-64
+peda-session-*
+.gdb_history

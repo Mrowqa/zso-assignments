@@ -5,9 +5,9 @@ clean:
 fakelib.so: fakelib.c
 	gcc -m32 -shared -fPIC -o fakelib.so fakelib.c
 
-libcrossld.so: crossld.c crossld_asm.S
-	nasm -f elf64 crossld_asm.S
-	gcc -shared -fPIC -o libcrossld.so crossld.c crossld_asm.o
+libcrossld.so:
+	(cd ../solution/; make)
+	ln -fs ../solution/libcrossld.so
 
 hello-32.o: hello-32.c
 	gcc -m32 -O3 -c hello-32.c

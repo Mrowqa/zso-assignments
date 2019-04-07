@@ -9,6 +9,11 @@
 #include "crossld.h"
 
 
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+
 #define GUEST_STACK_SIZE (1024 * 1024 * 4)
 // #define BREAKPOINT {__asm__ volatile (".byte 0xcc");}
 
