@@ -107,10 +107,6 @@ __get_eip:
     push eax
     retf
 
-; todo: (analyze)
-;   + stack alignment
-;   + saved registers
-
 [bits 64]
 __trampoline_step2:
     ; save registers which have to preserved in i386 calling convention
@@ -173,3 +169,4 @@ __trampoline_step3:
     ret  ; eax contains already converted result
 
 trampoline_32to64_end:
+

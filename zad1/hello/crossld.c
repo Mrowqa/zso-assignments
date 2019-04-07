@@ -10,7 +10,7 @@
 
 
 #define GUEST_STACK_SIZE (1024 * 1024 * 4)
-//#define BREAKPOINT {__asm__ volatile (".byte 0xcc");} // todo remove
+// #define BREAKPOINT {__asm__ volatile (".byte 0xcc");}
 
 
 extern uint8_t call_guest_code_start;
@@ -60,7 +60,6 @@ typedef struct mappings_info {
     size_t args_len;
 } mappings_info_t;
 
-// todo rename?
 void init_new_mappings(mappings_info_t *minfo, size_t capacity);
 void add_new_mapping(mappings_info_t *minfo, unmap_args_t args);
 void clear_all_mappings(mappings_info_t *minfo, int *ret_code);
@@ -86,13 +85,12 @@ uint32_t convert_return_value(uint64_t value, struct function *fun,
 #define TRAMPOLINE_GENERATION_OK 0
 
 
-// todo rename vars
-// todo move declaration to beggining?
-// todo jak duzo argsow? dotykanie stron pamieci po kolei?
-// todo czy funcs args sa poprawne?
-
-
 int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
+    // assumptions:
+    // * arguments types and return type are valid
+    // * elf file is not cut in halfway
+    // user can do stupid things anyway (we're loading executable code!)
+
     mappings_info_t minfo = {0};
     trampolines_info_t tinfo = {0};
     int ret_code = -1;
@@ -416,7 +414,6 @@ uint32_t get_trampoline(trampolines_info_t *tinfo, const char *sym_name) {
     return TRAMPOLINE_NOT_FOUND;
 }
 
-// todo test this!
 void convert_arguments(uint64_t *dst, uint32_t *src, struct function *fun,
         call_guest_code_exit_t exit_step2) {
     for (int i = 0; i < fun->nargs; i++) {
@@ -447,7 +444,6 @@ void convert_arguments(uint64_t *dst, uint32_t *src, struct function *fun,
     }
 }
 
-// todo test this
 uint32_t convert_return_value(uint64_t value, struct function *fun,
         call_guest_code_exit_t exit_step2) {
     int64_t signed_value = *((int64_t*) &value);
@@ -455,7 +451,7 @@ uint32_t convert_return_value(uint64_t value, struct function *fun,
     switch (fun->result) {
         case TYPE_VOID:
             return 0;
-        case TYPE_INT: // oh no, todo, int can't overflow
+        case TYPE_INT:
         case TYPE_LONG:
             if (signed_value < INT32_MIN || INT32_MAX < signed_value) {
                 exit_step2(-1);
