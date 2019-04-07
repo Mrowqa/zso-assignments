@@ -1,0 +1,39 @@
+aj370953
+
+Zależności:
+    nasm
+
+Budowanie:
+    make
+
+
+Rozwiązanie:
+    Kod podzieliłem pomiędzy dwa pliki: `crossld.c` oraz `crossld_asm.S`.
+    
+    Plik *.S zawiera jedną sekcję .rodata, w której jest kod szablonów trampolin.
+    Jeden dla _start/exit, oraz drugi dla wołań funkcji 64-bitowych z kodu 32-bitowego.
+    Trampoliny mają obok kodu zmienne "lokalne", które są patchowane w trakcie
+    generowania trampolin. Dzięki temu wszystkie trampoliny po wygenerowaniu kodu
+    są w pamięci z prawami R-X. Wszystkie trampoliny są obok siebie i kosztują jedno
+    wywołanie funkcji mmap. Miałem problem gdzie pamiętać oryginalne RSP, ale zmienna
+    lokalna trampoliny nie musi być do zapisu - może być wskaźnikiem do np. zmiennej
+    na stosie funkcji crossld_start :) .
+
+    Udało mi się obejść bez wstawek assemblerowych i magicznych ciągów bajtów.
+    Kod szablonów trampolin linkuję wraz z `crossld.c`, więc binarny kod trampolin
+    znajduje się już w pamięci libcrossld.so. Kod assemblerowy został tak napisany,
+    by można było go wołać jako funkcje z kodu w C.
+
+    Argumenty konwertuję w trikowy sposób:
+    (1) Rezerwuję odpowiednią ilość miejsca na stosie, tj. liczba argumentów * 8,
+        wyrównując od razu stos do 0 mod 16, i biorąc minimum 0x30, dzięki czemu
+        po konwersji mogę zrobić sekwencję popów dla pierwszych 6. argumentów
+        bez żadnych "ifów".
+    (2) Sama konwersja jest funkcją w C: otrzymuje ona wskaźniki: skąd ma przepisywać
+        argumenty i dokąd.
+
+    Stos alokuję jako jeden wielki obszar - jeśli program używa zbyt dużo, to dostanie
+    SIGSEGV-a. Ponadto zakładam, że argumenty crossld_start są poprawne (typy parametrów
+    i wartości zwracanej sprawdzane w runtimie przy konwersji), a ładowany elf, jeśli ma
+    poprawne nagłówki, to nie kończy się w połowie pliku -- choć i tak dużo warunków
+    sprawdzam.

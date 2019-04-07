@@ -92,8 +92,8 @@ uint32_t convert_return_value(uint64_t value, struct function *fun,
 
 int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
     // assumptions:
-    // * arguments types and return type are valid
-    // * elf file is not cut in halfway
+    // * arguments types and return type are valid (they are checked at runtime, though)
+    // * elf file is not cut in halfway (many things are checked, though)
     // user can do stupid things anyway (we're loading executable code!)
 
     mappings_info_t minfo = {0};
@@ -114,6 +114,7 @@ int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
     if (faddr == MAP_FAILED) {
         goto exit1;
     }
+    void *faddr_end = faddr + sb.st_size;
 
     // check elf header
     const Elf32_Ehdr *hdr = (Elf32_Ehdr*) faddr;
@@ -135,6 +136,9 @@ int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
     const Elf32_Phdr *segments = (Elf32_Phdr*) (faddr + hdr->e_phoff);
     size_t page_size = sysconf(_SC_PAGESIZE);
     if (page_size != 0x1000) {
+        goto exit2;
+    }
+    if ((void*) (&segments[hdr->e_phnum]) > faddr_end) {
         goto exit2;
     }
 
@@ -194,6 +198,10 @@ int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
     const Elf32_Rel *jmp_rel_tab_end = NULL;
     size_t plt_rel_sz = 0;
 
+    if ((void*) (&sections[hdr->e_shnum]) > faddr_end) {
+        goto exit2;
+    }
+
     for (size_t i = 0; i < hdr->e_shnum; i++) {
         const Elf32_Shdr *shdr = &sections[i];
 
@@ -247,7 +255,10 @@ int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
     }
 
     if (has_dyn_section) {
-        if (!sym_tab || !str_tab) {
+        if (!sym_tab || !str_tab ||
+                (void*) sym_tab > faddr_end || (void*)str_tab > faddr_end) {
+            // well, we should check check sym_tab_end and str_tab_end, but
+            // the assignment doesn't require it
             goto exit3;
         }
 
@@ -257,6 +268,9 @@ int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
             }
 
             jmp_rel_tab_end = (Elf32_Rel*) (((char*)jmp_rel_tab) + plt_rel_sz);
+            if ((void*) jmp_rel_tab_end > faddr_end) {
+                goto exit3;
+            }
 
             for (const Elf32_Rel *rel = jmp_rel_tab; rel < jmp_rel_tab_end; rel++) {
                 const char* sym = str_tab + sym_tab[ELF32_R_SYM(rel->r_info)].st_name;
