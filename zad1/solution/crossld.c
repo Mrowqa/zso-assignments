@@ -171,7 +171,10 @@ int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
             (phdr->p_flags & PF_W ? PROT_WRITE : 0) |
             (phdr->p_flags & PF_R ? PROT_READ : 0);
         int flags = MAP_PRIVATE | MAP_32BIT | MAP_FIXED_NOREPLACE;
-        size_t map_len = page_offset + phdr->p_memsz;
+        size_t map_len = page_offset + phdr->p_filesz;
+        if (map_len % page_size != 0) {
+            map_len += page_size - (map_len % page_size);
+        }
         void *segm = mmap((void*) vaddr_start, map_len,
             prot, flags, fd, file_start);
         
@@ -179,12 +182,26 @@ int crossld_start(const char *fname, const struct function *funcs, int nfuncs) {
             goto exit3;
         }
         add_new_mapping(&minfo, (unmap_args_t) {.ptr = segm, .len = map_len});
-
         if (segm != (void*)vaddr_start) {
             goto exit3;
         }
 
-        // memset(segm, '\0', page_offset);
+        size_t with_bss_map_len = page_offset + phdr->p_memsz;
+        if (map_len < with_bss_map_len) {
+            void *vaddr_start2 = ((void*) vaddr_start) + map_len;
+            size_t map_len2 = with_bss_map_len - map_len;
+            void *segm2 = mmap(vaddr_start2, map_len2, prot,
+                flags | MAP_ANONYMOUS, -1, 0);
+
+            if (segm2 == MAP_FAILED) {
+                goto exit3;
+            }
+            add_new_mapping(&minfo, (unmap_args_t) {.ptr = segm2, .len = map_len2});
+            if (segm2 != (void*)vaddr_start2) {
+                goto exit3;
+            }
+        }
+
         memset(segm + page_offset + phdr->p_filesz, '\0',
             phdr->p_memsz - phdr->p_filesz);
     }
@@ -352,8 +369,7 @@ int generate_trampolines(trampolines_info_t *tinfo, mappings_info_t *minfo,
         const struct function *funcs, int nfuncs, uint64_t *rsp_storage_ptr) {
     assert(tinfo);
     assert(minfo);
-    assert(funcs);
-    assert(nfuncs > 0);
+    assert(funcs && nfuncs > 0 || !funcs && nfuncs == 0);
     
     // allocate memory
     size_t trampolines_size = nfuncs * TRAMPOLINE_SIZE + CALL_GUEST_SIZE;

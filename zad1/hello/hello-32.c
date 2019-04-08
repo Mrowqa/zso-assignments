@@ -23,6 +23,8 @@ unsigned long long inc_ull(unsigned long long a); // { return a+1; }
 void multi_param(long a, long long b, int c);
 void lots_of_params(int a, int b, int c, int d, int e, int f, int g, int h, int i);
 
+char big_global_array[8192];
+
 unsigned long long hello()
 {
 	//long long a = inc_ll(0x1122334455667788);
