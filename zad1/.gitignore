@@ -1,4 +1,6 @@
 *.tar
+*.tar.gz
+*.tgz
 prog-32
 prog-64
 peda-session-*
