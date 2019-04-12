@@ -10,6 +10,7 @@ MODULE_LICENSE("GPL");
 
 #define HELLO_IOCTL_SET_REPEATS _IO('H', 0x00)
 #define HELLO_MAX_REPEATS 0x100
+#define HELLO_MAX_WRITE_BYTES 32
 
 static const char hello_reply[] = "Hello, world!\n";
 static size_t hello_len = sizeof hello_reply - 1;
@@ -54,15 +55,47 @@ static ssize_t hello_read(struct file *file, char __user *buf, size_t count, lof
 	return count;
 }
 
-static long hello_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
-{
-	if (cmd != HELLO_IOCTL_SET_REPEATS)
-		return -ENOTTY;
-	if (arg > HELLO_MAX_REPEATS)
+static ssize_t hello_write(struct file *filp, const char __user *buff, size_t count, loff_t *offp) {
+	char buffer[HELLO_MAX_WRITE_BYTES] = {0};
+	long old_repeats = 0;
+	long repeats = 0;
+	size_t it = 0;
+	
+	if (count > HELLO_MAX_WRITE_BYTES) {
 		return -EINVAL;
-	hello_repeats = arg;
-	return 0;
+	}
+
+	if (copy_from_user(buffer, buff, count) != 0) {
+		return -EFAULT;
+	}
+
+	for (it = 0; it < count; it++) {
+		if (it == count - 1 && buffer[it] == '\n') {
+			break;
+		}
+		else if (buffer[it] < '0' || '9' < buffer[it]) {
+			return -EINVAL;
+		}
+		old_repeats = repeats;
+		repeats = repeats * 10 + (buffer[it] - '0');
+		if (repeats < old_repeats) { // overflow
+			return -EINVAL;
+		}
+	}
+
+	hello_repeats = repeats;
+	return count;
 }
+
+// static long hello_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+// {
+// 	if (cmd != HELLO_IOCTL_SET_REPEATS)
+// 		return -ENOTTY;
+// 	if (arg > HELLO_MAX_REPEATS)
+// 		return -EINVAL;
+// 	hello_repeats = arg;
+// 	return 0;
+// }
 
 static int hello_open(struct inode *ino, struct file *filep);
 static int hello_release(struct inode *ino, struct file *filep);
@@ -77,9 +110,10 @@ static struct file_operations hello_once_fops = {
 static struct file_operations hello_fops = {
 	.owner = THIS_MODULE,
 	.read = hello_read,
+	.write = hello_write,
 	.open = hello_open,
-	.unlocked_ioctl = hello_ioctl,
-	.compat_ioctl = hello_ioctl,
+	// .unlocked_ioctl = hello_ioctl,
+	// .compat_ioctl = hello_ioctl,
 	.release = hello_release,
 };
 
