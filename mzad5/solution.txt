@@ -1,0 +1,31 @@
+Błąd znajduje się w scull.c, w scull_write.
+W linii 358 wołamy kzalloc i nie sprawdzamy kodu błędu.
+
+Jeśli przy pomocy ioctl ustawimy qset na odpowiednią wartość
+strimujemy urządzenie i ponownie do niego zapiszemy,
+to w linii 358 będziemy pytać o tyle pamięci, że kzalloc zwróci błąd (NULL).
+Możemy pytać o zero pamięci (qset=1<<30 * 4==sizeof char*) albo dużo pamięci
+(qset trochę mniejszy niż wcześniej) - można poeksperymentować,
+co wywali kzalloc.
+
+Dalej, odczytujemy "dptr->data[s_pos]", a skoro dptr->data == NULL,
+więc odczytujemy dane spod (void*)s_pos.
+Jest to arbitralne miejsce w pamięci (nazwijmy je A).
+Jeśli je kontrolujemy (jest to np. miejsce w naszym innym buforze),
+wpisujemy tam dowolny adres (nazwijmy go B).
+Dalej, w linii 369 pod adres B zapisujemy dane od użytkownika przy pomocy
+copy_from_user, więc możemy pisać po dowolnej pamięci jądra.
+
+s_pos możemy ustawić na dowolną wartość - jeśli qset jest duże, a quantum=1,
+to w praktyce s_pos == *f_pos (jeśli *f_pos < qset).
+Można dokładniej przeanalizować jak to ustawiać - nie eksploitowałem
+tego błędu.
+
+Można również się zastanowić do czego dojdziemy, jeśli argument kzalloc
+się przekręci (mnożymy liczbę od użytkownika przez wielkość wskaźnika).
+Jeśli (qset=(1<<30) + 1), to w praktyce zaalokujemy 4 bajty,
+choć program będzie myślał, że tablica jest większa.
+Dzięki temu "dptr->data[1]" będzie odczytem danych
+spoza naszej zaalokowanej pamięci, i jeśli jest to pamięć, którą również
+kontrolujemy (bo alokator nam ją przydzielił), jest to nasze miejsce B
+z rozumowania wyżej, więc możemy pisać w dowolne miejsce pamięci jądra.
