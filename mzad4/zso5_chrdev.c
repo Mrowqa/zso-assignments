@@ -34,12 +34,7 @@ typedef struct repeats_map {
 	long repeats;
 } repeats_map_t;
 
-static repeats_map_t hello_repeats_map = {
-	.list = LIST_HEAD_INIT(hello_repeats_map.list),
-	.uid = 0, // init for root
-	.repeats = HELLO_DEFAULT_REPEATS,
-};
-
+static LIST_HEAD(hello_repeats_map);
 static DEFINE_MUTEX(hello_repeats_mutex);
 
 static ssize_t hello_repeats_set(uid_t user, long value) {
@@ -49,7 +44,7 @@ static ssize_t hello_repeats_set(uid_t user, long value) {
 	ssize_t result = 0;
 
 	mutex_lock(&hello_repeats_mutex);
-	list_for_each_entry(pos, &hello_repeats_map.list, list) {
+	list_for_each_entry(pos, &hello_repeats_map, list) {
 		if (pos->uid == user) {
 			pos->repeats = value;
 			found = 1;
@@ -57,7 +52,7 @@ static ssize_t hello_repeats_set(uid_t user, long value) {
 		}
 	}
 	if (!found && value != HELLO_DEFAULT_REPEATS) {
-		new_elem = kmalloc(sizeof(repeats_map_t), GFP_ATOMIC);
+		new_elem = kmalloc(sizeof(repeats_map_t), GFP_KERNEL);
 		if (new_elem == NULL) {
 			result = -ENOMEM;
 		}
@@ -65,7 +60,7 @@ static ssize_t hello_repeats_set(uid_t user, long value) {
 			INIT_LIST_HEAD(&new_elem->list);
 			new_elem->uid = user;
 			new_elem->repeats = value;
-			list_add_tail(&new_elem->list, &hello_repeats_map.list);
+			list_add_tail(&new_elem->list, &hello_repeats_map);
 		}
 	}
 	mutex_unlock(&hello_repeats_mutex);
@@ -78,7 +73,7 @@ static long hello_repeats_get(uid_t user) {
 	long result = HELLO_DEFAULT_REPEATS;
 
 	mutex_lock(&hello_repeats_mutex);
-	list_for_each_entry(pos, &hello_repeats_map.list, list) {
+	list_for_each_entry(pos, &hello_repeats_map, list) {
 		if (pos->uid == user) {
 			result = pos->repeats;
 			break;
@@ -92,14 +87,11 @@ static long hello_repeats_get(uid_t user) {
 static void hello_repeats_cleanup(void) {
 	repeats_map_t *pos = NULL;
 	repeats_map_t *n = NULL;
-	struct list_head *head = &hello_repeats_map.list;
 
 	mutex_lock(&hello_repeats_mutex);
-	list_for_each_entry_safe(pos, n, head, list) {
-		if (&pos->list != head) {
-			list_del(&pos->list);
-			kfree(pos);
-		}
+	list_for_each_entry_safe(pos, n, &hello_repeats_map, list) {
+		list_del(&pos->list);
+		kfree(pos);
 	}
 	mutex_unlock(&hello_repeats_mutex);
 }
