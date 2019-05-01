@@ -1,0 +1,2 @@
+scull-objs := main.o pipe.o access.o
+obj-m   := scull.o
