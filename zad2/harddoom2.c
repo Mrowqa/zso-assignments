@@ -44,7 +44,7 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 	if (!bar0) {
 		dev_err(&pdev->dev, "Failed: pci_iomap");
 		ret = -EFAULT;
-		goto err_1;
+		goto err_0;
 	}
 
 	// alloc drvdata and bind
@@ -52,7 +52,7 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 	if (!devctx) {
 		dev_err(&pdev->dev, "Failed: kmalloc for driver data");
 		ret = -ENOMEM;
-		goto err_2;
+		goto err_1;
 	}
 	devctx->bar0 = bar0;
 	pci_set_drvdata(pdev, devctx);
@@ -74,12 +74,11 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 
 	return ret;
 
-err_2:
-	pci_iounmap(pdev, bar0);
 err_1:
-	pci_release_regions(pdev);
+	pci_iounmap(pdev, bar0);
 err_0:
 	pci_disable_device(pdev);
+	pci_release_regions(pdev); // should be called after pci_disable_device()
 	return ret;
 }
 
@@ -92,8 +91,8 @@ static void harddoom2_remove(struct pci_dev *pdev) {
 	ioread32(devctx->bar0 + HARDDOOM2_ENABLE);
 
 	pci_iounmap(pdev, devctx->bar0);
-	pci_release_regions(pdev);
 	pci_disable_device(pdev);
+	pci_release_regions(pdev); // should be called after pci_disable_device()
 	kfree(devctx);
 }
 
