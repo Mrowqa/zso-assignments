@@ -29,8 +29,7 @@ static DEFINE_MUTEX(doomdev_used_minors_mutex);
 
 struct harddoom2_pcidevdata {
 	void __iomem *bar0;
-	struct cdev doom_cdev;
-	struct device *doom_dev; // todo remove, not needed
+	struct cdev doomdev;
 };
 
 
@@ -79,6 +78,7 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 	uint32_t code_it, code_size;
 	void __iomem *bar0;
 	struct harddoom2_pcidevdata *pddata;
+	struct device *sysfs_dev;
 
 	// enable device, map memory
 	ret = pci_enable_device(pdev);
@@ -111,19 +111,19 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 	pci_set_drvdata(pdev, pddata);
 
 	// prepare chrdev
-	cdev_init(&pddata->doom_cdev, &doomdev_fops);
+	cdev_init(&pddata->doomdev, &doomdev_fops);
 	minor = doomdev_alloc_minor();
 	if (minor == DOOMDEV_NO_AVAILABLE_MINOR) {
 		ret = -ENOSPC;
 		goto err_2;
 	}
-	ret = cdev_add(&pddata->doom_cdev, minor, 1);
+	ret = cdev_add(&pddata->doomdev, minor, 1);
 	if (ret) {
 		goto err_3;
 	}
-	pddata->doom_dev = device_create(&doomdev_class, &pdev->dev, minor, NULL /*todo*/, "doom%d", minor - doomdev_major);
-	if (IS_ERR(pddata->doom_dev)) {
-		ret = PTR_ERR(pddata->doom_dev);
+	sysfs_dev = device_create(&doomdev_class, &pdev->dev, minor, NULL /*todo*/, "doom%d", minor - doomdev_major);
+	if (IS_ERR(sysfs_dev)) {
+		ret = PTR_ERR(sysfs_dev);
 		goto err_4;
 	}
 
@@ -143,7 +143,7 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 	return ret;
 
 err_4:
-	cdev_del(&pddata->doom_cdev);
+	cdev_del(&pddata->doomdev);
 err_3:
 	doomdev_dealloc_minor(minor);
 err_2:
@@ -166,9 +166,9 @@ static void harddoom2_remove(struct pci_dev *pdev) {
 	ioread32(pddata->bar0 + HARDDOOM2_ENABLE);
 
 	// destroy chrdev
-	device_destroy(&doomdev_class, pddata->doom_cdev.dev);
-	cdev_del(&pddata->doom_cdev); // mwk said "we don't have to care about opened fd"
-	doomdev_dealloc_minor(pddata->doom_cdev.dev);
+	device_destroy(&doomdev_class, pddata->doomdev.dev);
+	cdev_del(&pddata->doomdev); // mwk said "we don't have to care about opened fd"
+	doomdev_dealloc_minor(pddata->doomdev.dev);
 
 	// release pci device
 	pci_iounmap(pdev, pddata->bar0);
