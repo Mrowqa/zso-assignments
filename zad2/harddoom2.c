@@ -1,4 +1,6 @@
 // TODO remove unused headers
+// TODO cleanup cmd buffer somehow
+// TODO handle interruptions (?)
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/ioctl.h>
@@ -42,6 +44,9 @@ struct harddoom2_pcidevdata {
 	struct pci_dev *pdev;
 	void __iomem *bar0;
 	struct cdev doomdev2;
+
+	struct doomdev2_ctx *last_active_ctx;
+	struct mutex sync_queue_mutex; // used for sending to queue and operating on last_active_ctx member
 };
 
 struct doomdev2_ctx {
@@ -50,7 +55,16 @@ struct doomdev2_ctx {
 	struct mutex buffers_mutex; // todo some RW lock instead?
 	struct kref kref;
 
-	// todo active buffers fds
+	struct {
+		// struct doomdev2_dma_buffer *cmd;
+		struct doomdev2_dma_buffer *surf_dst;
+		struct doomdev2_dma_buffer *surf_src;
+		struct doomdev2_dma_buffer *texture;
+		struct doomdev2_dma_buffer *flat;
+		struct doomdev2_dma_buffer *colormap;
+		struct doomdev2_dma_buffer *translation;
+		struct doomdev2_dma_buffer *tranmap;
+	} active_bufs;
 };
 
 struct doomdev2_dma_page {
@@ -60,6 +74,7 @@ struct doomdev2_dma_page {
 
 // represents surfaces and buffers
 struct doomdev2_dma_buffer {
+	// todo mutex (user can use multiple threads)
 	struct doomdev2_ctx *ctx;
 	int32_t width;
 	int32_t height; // if zero, then it's a buffer, not a surface
@@ -277,6 +292,15 @@ static long doomdev2_ioctl_create_buffer(struct doomdev2_ctx *ctx, struct doomde
 	return doomdev2_dma_buffer_create(ctx, data_cb->size, data_cb->size, 0);
 }
 
+static long doomdev2_ioctl_setup(struct doomdev2_ctx *ctx, struct doomdev2_ioctl_setup *data_s) {
+	// todo
+	// validate fds
+	// set them as active buffers in ctx
+	// set last active context in pci dev to NULL (will trigger setup before next command is sent)
+
+	return 0; // TODO
+}
+
 static long doomdev2_ioctl(struct file *filep, unsigned int cmd, unsigned long arg) {
 	long ret;
 	void __user *arg_ptr = (void __user*) arg;
@@ -284,7 +308,7 @@ static long doomdev2_ioctl(struct file *filep, unsigned int cmd, unsigned long a
 
 	struct doomdev2_ioctl_create_surface data_cs;
 	struct doomdev2_ioctl_create_buffer data_cb;
-	// struct doomdev2_ioctl_setup data_s; // todo
+	struct doomdev2_ioctl_setup data_s;
 
 	switch (cmd) {
 		case DOOMDEV2_IOCTL_CREATE_SURFACE:
@@ -302,7 +326,11 @@ static long doomdev2_ioctl(struct file *filep, unsigned int cmd, unsigned long a
 			ret = doomdev2_ioctl_create_buffer(ctx, &data_cb);
 			break;
 		case DOOMDEV2_IOCTL_SETUP:
-			ret = 0; // todo call
+			ret = copy_from_user(&data_s, arg_ptr, sizeof(data_s));
+			if (!ret) {
+				return -EFAULT;
+			}
+			ret = doomdev2_ioctl_setup(ctx, &data_s);
 			break;
 		default:
 			ret = -ENOTTY;
@@ -324,6 +352,7 @@ static int doomdev2_open(struct inode *ino, struct file *filep) {
 	INIT_LIST_HEAD(&ctx->buffers);
 	mutex_init(&ctx->buffers_mutex);
 	kref_init(&ctx->kref);
+	memset(&ctx->active_bufs, 0, sizeof(ctx->active_bufs));
 
 	filep->private_data = ctx;
 
@@ -345,6 +374,7 @@ static struct file_operations doomdev2_fops = {
 	.release = doomdev2_release,
 	.unlocked_ioctl = doomdev2_ioctl,
 	.compat_ioctl = doomdev2_ioctl,
+	.llseek = no_llseek,
 	// todo
     // ssize_t (*write) (struct file *, const char __user *, size_t, loff_t *);
 };
@@ -374,6 +404,7 @@ static void doomdev2_dealloc_minor(dev_t minor) {
 
 static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id) {
 	int ret = 0;
+	int minor_zero_based;
 	dev_t minor;
 	uint32_t code_it, code_size;
 	void __iomem *bar0;
@@ -409,16 +440,20 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 	}
 	pddata->pdev = pdev;
 	pddata->bar0 = bar0;
+	pddata->last_active_ctx = NULL;
+	mutex_init(&pddata->sync_queue_mutex);
 	pci_set_drvdata(pdev, pddata);
 
 	// set up dma
 	pci_set_master(pdev);
 	ret = pci_set_dma_mask(pdev, HARDDOOM2_DMA_MASK);
-	if (!ret) {
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to set PCI DMA mask");
 		goto err_2;
 	}
 	ret = pci_set_consistent_dma_mask(pdev, HARDDOOM2_DMA_MASK);
-	if (!ret) {
+	if (ret) {
+		dev_err(&pdev->dev, "Failed to set consistent PCI DMA mask");
 		goto err_2;
 	}
 
@@ -438,16 +473,20 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 	// prepare chrdev (after booting device)
 	cdev_init(&pddata->doomdev2, &doomdev2_fops);
 	minor = doomdev2_alloc_minor();
+	minor_zero_based = minor - doomdev2_major;
 	if (minor == DOOMDEV2_NO_AVAILABLE_MINOR) {
+		dev_err(&pdev->dev, "Failed: no available minor to register new device");
 		ret = -ENOSPC;
 		goto err_3;
 	}
 	ret = cdev_add(&pddata->doomdev2, minor, 1);
 	if (ret) {
+		dev_err(&pdev->dev, "Failed to add cdev, minor %d", minor_zero_based);
 		goto err_4;
 	}
-	sysfs_dev = device_create(&doomdev2_class, &pdev->dev, minor, NULL, "doom%d", minor - doomdev2_major);
+	sysfs_dev = device_create(&doomdev2_class, &pdev->dev, minor, NULL, "doom%d", minor_zero_based);
 	if (IS_ERR(sysfs_dev)) {
+		dev_err(&pdev->dev, "Failed to create sysfs device, minor %d", minor_zero_based);
 		ret = PTR_ERR(sysfs_dev);
 		goto err_5;
 	}
