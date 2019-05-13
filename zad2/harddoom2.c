@@ -29,6 +29,14 @@ MODULE_DESCRIPTION("HardDoom ][ tm device");
 #define DOOMDEV2_MAX_SURFACE_SIZE 		2048
 #define DOOMDEV2_MIN_BUFFER_SIZE		1
 #define DOOMDEV2_MAX_BUFFER_SIZE		(2048 * 2048)
+#define DOOMDEV2_BUFFER_FLAT_ALIGNMENT	(1 << 12)
+#define DOOMDEV2_BUFFER_COLORMAP_ALIGNMENT	256
+#define DOOMDEV2_BUFFER_TRANMAP_SIZE	(1 << 16)
+// todo dma page table alignment
+// todo "i pilnować wysyłanych poleceń, czyli:
+	// weryfikować, że wysyłane współrzędne y mieszczą się w wysokości buforów ramek, (x też warto!)
+	// limitować odczyt tekseli z tekstur kolumnowych przez użycie TEXTURE_LIMIT,
+	// weryfikować, że FLAT_IDX, COLORMAP_IDX, TRANSLATION_IDX mieszczą się w rozmiarze odpowiednich atlasów."
 
 static const char harddoom2_name[] = { "harddoom2" };
 static struct pci_driver harddoom2_driver;
@@ -46,7 +54,8 @@ struct harddoom2_pcidevdata {
 	struct cdev doomdev2;
 
 	struct doomdev2_ctx *last_active_ctx;
-	struct mutex sync_queue_mutex; // used for sending to queue and operating on last_active_ctx member
+	struct mutex sync_queue_mutex; // used for sending to queue and
+	                               // operating on last_active_ctx member, and doomdev2_ctx::active_bufs
 };
 
 struct doomdev2_ctx {
@@ -85,6 +94,8 @@ struct doomdev2_dma_buffer {
 	size_t pages_cnt;
 	struct doomdev2_dma_page pages[0];
 };
+#define DOOMDEV2_DMA_BUFFER_SIZE(dma_buf) \
+	((dma_buf)->width * max(1, (dma_buf)->height))
 
 void doomdev2_ctx_deallocate(struct kref *kref) {
 	struct doomdev2_ctx *ctx = container_of(kref, struct doomdev2_ctx, kref);
@@ -107,7 +118,7 @@ static int doomdev2_ctx_register_buffer(struct doomdev2_ctx *ctx, struct doomdev
 }
 
 static void doomdev2_ctx_unregister_buffer(struct doomdev2_dma_buffer *dma_buf) {
-	mutex_lock(&dma_buf->ctx->buffers_mutex);
+	mutex_lock(&dma_buf->ctx->buffers_mutex); // better not to fail in destructor
 	list_del(&dma_buf->list);
 	mutex_unlock(&dma_buf->ctx->buffers_mutex);
 
@@ -141,6 +152,8 @@ static struct doomdev2_dma_buffer *doomdev2_dma_alloc_buffer(struct doomdev2_ctx
 		if (!page_it->phys_addr) {
 			goto dma_alloc_err;
 		}
+		BUG_ON(((uint64_t)page_it->phys_addr) % HARDDOOM2_PAGE_SIZE != 0
+			|| page_it->dma_handle % HARDDOOM2_PAGE_SIZE != 0);
 	}
 
 	return dma_buf;
@@ -178,15 +191,108 @@ static int doomdev2_dma_buffer_release(struct inode *_ino, struct file *filep) {
 	return 0;
 }
 
+static loff_t doomdev2_dma_buffer_llseek(struct file *filep, loff_t off, int whence) {
+	struct doomdev2_dma_buffer *dma_buf = (struct doomdev2_dma_buffer*) filep->private_data;
+	size_t buf_size = DOOMDEV2_DMA_BUFFER_SIZE(dma_buf);
+	loff_t ret;
+
+	ret = mutex_lock_interruptible(&filep->f_pos_lock);
+	if (ret) {
+		return ret;
+	}
+
+	switch (whence) {
+		case SEEK_SET:
+			ret = off;
+			break;
+		case SEEK_CUR:
+			ret = filep->f_pos + off;
+			break;
+		case SEEK_END:
+			ret = buf_size + off;
+			break;
+		default:
+			ret = -EINVAL;
+			goto err_out;
+	}
+
+	filep->f_pos = ret;
+
+err_out:
+	mutex_unlock(&filep->f_pos_lock);
+
+	return ret;
+}
+
+
+static ssize_t doomdev2_dma_buffer_io(struct file *filep, char __user *buff_read, const char __user *buff_write,
+		size_t count, loff_t *offp) {
+	struct doomdev2_dma_buffer *dma_buf = (struct doomdev2_dma_buffer*) filep->private_data;
+	loff_t buf_size = DOOMDEV2_DMA_BUFFER_SIZE(dma_buf);
+	ssize_t ret;
+
+	BUG_ON((buff_read && buff_write) || (!buff_read && !buff_write));
+
+	ret = mutex_lock_interruptible(&dma_buf->ctx->pddata->sync_queue_mutex);
+	if (ret) {
+		return ret;
+	}
+
+	ret = 0;
+
+	if (*offp < 0) {
+		ret = -EINVAL;
+		goto exit_op;
+	}
+
+	while (*offp < buf_size && ret < count) {
+		ssize_t to_copy = min(
+			min(round_up(*offp + 1, HARDDOOM2_PAGE_SIZE), buf_size) - *offp,
+			(loff_t) (count - ret));
+		size_t page_idx = *offp / HARDDOOM2_PAGE_SIZE + 1; // +1 because of page table at idx 0
+		ssize_t page_offset = *offp % HARDDOOM2_PAGE_SIZE;
+		unsigned long not_copied = 0;
+
+		if (buff_write) {
+			not_copied = copy_from_user(dma_buf->pages[page_idx].phys_addr + page_offset, buff_write + ret, to_copy);
+		}
+		else {
+			not_copied = copy_to_user(buff_read + ret, dma_buf->pages[page_idx].phys_addr + page_offset, to_copy);
+		}
+		ret += to_copy - not_copied;
+		*offp += to_copy - not_copied;
+		if (not_copied > 0) {
+			if (ret == 0) {
+				ret = -EFAULT;
+			}
+			goto exit_op;
+		}
+	}
+
+	if (buff_write && ret == 0 && count > 0) {
+		ret = -ENOSPC;
+	}
+
+exit_op:
+	mutex_unlock(&dma_buf->ctx->pddata->sync_queue_mutex);
+
+	return ret;
+}
+
+static ssize_t doomdev2_dma_buffer_read(struct file *filep, char __user *buff, size_t count, loff_t *offp) {
+	return doomdev2_dma_buffer_io(filep, buff, NULL, count, offp);
+}
+
+static ssize_t doomdev2_dma_buffer_write(struct file *filep, const char __user *buff, size_t count, loff_t *offp) {
+	return doomdev2_dma_buffer_io(filep, NULL, buff, count, offp);
+}
+
 static struct file_operations doomdev2_dma_buffer_fops = {
 	.owner = THIS_MODULE,
 	.release = doomdev2_dma_buffer_release,
-	// todo
-	// loff_t (*llseek) (struct file *, loff_t, int);
-    // ssize_t (*read) (struct file *, char __user *, size_t, loff_t *);
-    // ssize_t (*write) (struct file *, const char __user *, size_t,
-    //     loff_t *);
-    /* ... */
+	.llseek = doomdev2_dma_buffer_llseek,
+	.read = doomdev2_dma_buffer_read,
+	.write = doomdev2_dma_buffer_write,
 };
 
 static int doomdev2_dma_alloc_install_fd(struct doomdev2_dma_buffer *dma_buf) {
@@ -293,12 +399,111 @@ static long doomdev2_ioctl_create_buffer(struct doomdev2_ctx *ctx, struct doomde
 }
 
 static long doomdev2_ioctl_setup(struct doomdev2_ctx *ctx, struct doomdev2_ioctl_setup *data_s) {
-	// todo
-	// validate fds
-	// set them as active buffers in ctx
-	// set last active context in pci dev to NULL (will trigger setup before next command is sent)
+	int ret = 0;
+	typeof(ctx->active_bufs) tmp_bufs;
 
-	return 0; // TODO
+	inline struct doomdev2_dma_buffer *find_fd(int32_t fd) {
+		// assumption: buffers_mutex is locked
+		struct doomdev2_dma_buffer *it;
+
+		list_for_each_entry(it, &ctx->buffers, list) {
+			if (it->fd == fd) {
+				return it;
+			}
+		}
+
+		return NULL;
+	}
+
+	inline int validate_set_buf(struct doomdev2_dma_buffer **dst, int32_t fd,
+			bool is_surface, size_t size_divider, bool exact_size) {
+		struct doomdev2_dma_buffer *dma_buf;
+
+		if (fd != -1) {
+			size_t size;
+			dma_buf = find_fd(fd);
+			if (!dma_buf) {
+				return -EINVAL;
+			}
+			if (is_surface ? dma_buf->height <= 0 : dma_buf->height > 0) {
+				return -EINVAL;
+			}
+			size = DOOMDEV2_DMA_BUFFER_SIZE(dma_buf);
+			if (exact_size ? size != size_divider : size % size_divider != 0) {
+				return -EINVAL;
+			}
+			// alignment is ensured by dma_alloc_coherent
+		}
+		else {
+			dma_buf = NULL;
+		}
+
+		*dst = dma_buf;
+		return 0;
+	}
+
+	ret = mutex_lock_interruptible(&ctx->buffers_mutex);
+	if (ret) {
+		return ret;
+	}
+
+	memset(&tmp_bufs, 0, sizeof(tmp_bufs));
+
+	// validate fds
+#define DOOMDEV2_LOCAL_CHECK(WHAT) do { \
+		ret = (WHAT); \
+		if (ret) { \
+			goto err_unlock_buffers; \
+		} \
+	} while (0)
+
+	DOOMDEV2_LOCAL_CHECK(validate_set_buf(&tmp_bufs.surf_dst,    data_s->surf_dst_fd,     true,  1, false));
+	DOOMDEV2_LOCAL_CHECK(validate_set_buf(&tmp_bufs.surf_src,    data_s->surf_src_fd,     true,  1, false));
+	DOOMDEV2_LOCAL_CHECK(validate_set_buf(&tmp_bufs.texture,     data_s->texture_fd,      false, 1, false));
+	DOOMDEV2_LOCAL_CHECK(validate_set_buf(&tmp_bufs.flat,        data_s->flat_fd,         false, DOOMDEV2_BUFFER_FLAT_ALIGNMENT,     false));
+	DOOMDEV2_LOCAL_CHECK(validate_set_buf(&tmp_bufs.colormap,    data_s->colormap_fd,     false, DOOMDEV2_BUFFER_COLORMAP_ALIGNMENT, false));
+	DOOMDEV2_LOCAL_CHECK(validate_set_buf(&tmp_bufs.translation, data_s->translation_fd,  false, DOOMDEV2_BUFFER_COLORMAP_ALIGNMENT, false));
+	DOOMDEV2_LOCAL_CHECK(validate_set_buf(&tmp_bufs.tranmap,     data_s->tranmap_fd,      false, DOOMDEV2_BUFFER_TRANMAP_SIZE, true));
+#undef DOOMDEV2_LOCAL_CHECK
+
+	// cache invalidation (will trigger setup command before next command is sent)
+	ret = mutex_lock_interruptible(&ctx->pddata->sync_queue_mutex);
+	if (ret) {
+		goto err_unlock_buffers;
+	}
+	if (ctx->pddata->last_active_ctx == ctx) {
+		ctx->pddata->last_active_ctx = NULL;
+	}
+
+	// we want consistent state, sync_queue_mutex guards buffers of contexts, too
+
+	// increase ref count on new context
+	get_file(tmp_bufs.surf_dst->file);
+	get_file(tmp_bufs.surf_src->file);
+	get_file(tmp_bufs.texture->file);
+	get_file(tmp_bufs.flat->file);
+	get_file(tmp_bufs.colormap->file);
+	get_file(tmp_bufs.translation->file);
+	get_file(tmp_bufs.tranmap->file);
+
+	// then decrease ref count on old context
+	fput(ctx->active_bufs.surf_dst->file);
+	fput(ctx->active_bufs.surf_src->file);
+	fput(ctx->active_bufs.texture->file);
+	fput(ctx->active_bufs.flat->file);
+	fput(ctx->active_bufs.colormap->file);
+	fput(ctx->active_bufs.translation->file);
+	fput(ctx->active_bufs.tranmap->file);
+
+	// set them as active buffers in ctx
+	ctx->active_bufs = tmp_bufs;
+
+	mutex_unlock(&ctx->pddata->sync_queue_mutex);
+
+err_unlock_buffers:
+	mutex_unlock(&ctx->buffers_mutex);
+
+	return ret;
 }
 
 static long doomdev2_ioctl(struct file *filep, unsigned int cmd, unsigned long arg) {
@@ -384,7 +589,7 @@ static dev_t doomdev2_alloc_minor(void) {
 	dev_t ret = DOOMDEV2_NO_AVAILABLE_MINOR;
 	int minor;
 
-	mutex_lock(&doomdev2_used_minors_mutex);
+	mutex_lock(&doomdev2_used_minors_mutex); // not called by user, no need for _interruptible
 	minor = find_next_zero_bit(doomdev2_used_minors, HARDDOOM2_MAX_DEVICES, 0);
 	if (minor < HARDDOOM2_MAX_DEVICES) { // success
 		bitmap_set(doomdev2_used_minors, minor, 1);
@@ -396,7 +601,7 @@ static dev_t doomdev2_alloc_minor(void) {
 }
 
 static void doomdev2_dealloc_minor(dev_t minor) {
-	mutex_lock(&doomdev2_used_minors_mutex);
+	mutex_lock(&doomdev2_used_minors_mutex);  // better not to fail in destructor & not called by user
 	bitmap_clear(doomdev2_used_minors, minor - doomdev2_major, 1);
 	mutex_unlock(&doomdev2_used_minors_mutex);
 }
