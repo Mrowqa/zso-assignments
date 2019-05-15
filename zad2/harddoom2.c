@@ -1,5 +1,4 @@
 // TODO remove unused headers
-// TODO handle interruptions (?)
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/ioctl.h>
@@ -12,6 +11,7 @@
 #include <linux/slab.h>
 #include <linux/pci.h>
 #include <linux/anon_inodes.h>
+#include <linux/completion.h>
 #include "harddoom2.h"
 #include "doomcode2.h"
 #include "doomdev2.h"
@@ -28,8 +28,11 @@ MODULE_DESCRIPTION("HardDoom ][ tm device");
 #define HARDDOOM2_CMD_SETUP_TRANSLATION_PT_IDX	5
 #define HARDDOOM2_CMD_SETUP_COLORMAP_PT_IDX		6
 #define HARDDOOM2_CMD_SETUP_TRANMAP_PT_IDX		7
-#define HARDDOOM2_CMD_SIZE_IN_WORDS		8
 #define HARDDOOM2_CMD_SETUP_PT_SHIFT	8
+#define HARDDOOM2_INTR_ERROR(i)			(0x10 << (i))
+#define HARDDOOM2_INTR_ERRORS_CNT		12
+#define HARDDOOM2_INTR_ERRORS_MASK		0xfff0
+#define HARDDOOM2_TEXTURE_LIMIT_UNITS	64
 #define DOOMDEV2_NO_AVAILABLE_MINOR		(-1)
 #define DOOMDEV2_DMA_BUFFER_NO_VALUE	(-1)
 #define DOOMDEV2_MIN_SURFACE_SIZE 		1
@@ -37,8 +40,8 @@ MODULE_DESCRIPTION("HardDoom ][ tm device");
 #define DOOMDEV2_MAX_SURFACE_SIZE 		2048
 #define DOOMDEV2_MIN_BUFFER_SIZE		1
 #define DOOMDEV2_MAX_BUFFER_SIZE		(2048 * 2048)
-#define DOOMDEV2_BUFFER_FLAT_ALIGNMENT	(1 << 12)
-#define DOOMDEV2_BUFFER_COLORMAP_ALIGNMENT	256
+#define DOOMDEV2_BUFFER_FLAT_SIZE		(1 << 12)
+#define DOOMDEV2_BUFFER_COLORMAP_SIZE	256
 #define DOOMDEV2_BUFFER_TRANMAP_SIZE	(1 << 16)
 // todo "i pilnować wysyłanych poleceń, czyli:
 	// weryfikować, że wysyłane współrzędne y mieszczą się w wysokości buforów ramek, (x też warto!)
@@ -54,6 +57,7 @@ static struct class doomdev2_class = {
 };
 static DECLARE_BITMAP(doomdev2_used_minors, HARDDOOM2_MAX_DEVICES);
 static DEFINE_MUTEX(doomdev2_used_minors_mutex);
+static volatile uint32_t harddoom2_intr_error_flags;
 
 
 struct doomdev2_ctx_buffers {
@@ -74,6 +78,7 @@ struct harddoom2_pcidevdata {
 
 	struct doomdev2_ctx_buffers last_active_bufs; // note: NEVER deref pointers inside (we hold weak reference here)
 	struct mutex sync_queue_mutex; // used for sending to queue and operating on last_active_bufs member
+	struct completion pong_sync;
 };
 
 struct doomdev2_ctx {
@@ -107,10 +112,43 @@ struct doomdev2_dma_buffer {
 	((dma_buf)->width * max(1, (dma_buf)->height))
 
 struct harddoom2_cmd_buf {
-	uint32_t w[HARDDOOM2_CMD_SIZE_IN_WORDS];
+	uint32_t w[HARDDOOM2_CMD_SEND_SIZE];
 };
 
-void doomdev2_ctx_deallocate(struct kref *kref) {
+static irqreturn_t harddoom2_irq_handler(int _irq, void *dev) {
+	struct harddoom2_pcidevdata *pddata = (struct harddoom2_pcidevdata*) dev;
+	uint32_t flags, error_flags;
+
+	// read interruptions
+	flags = ioread32(pddata->bar0 + HARDDOOM2_INTR);
+	if (!flags) {
+		return IRQ_NONE;
+	}
+
+	// handle interruptions
+	if (flags & HARDDOOM2_INTR_FENCE) {
+		// todo
+	}
+
+	if (flags & HARDDOOM2_INTR_PONG_SYNC) {
+		complete(&pddata->pong_sync);
+	}
+
+	if (flags & HARDDOOM2_INTR_PONG_ASYNC) {
+		// todo
+	}
+
+	error_flags = flags & HARDDOOM2_INTR_ERRORS_MASK;
+	// __atomic_store(&harddoom2_intr_error_flags, &error_flags, __ATOMIC_SEQ_CST);
+	harddoom2_intr_error_flags |= error_flags; // todo make this op atomic
+
+	// disable interruptions (mark as done)
+	iowrite32(flags, pddata->bar0 + HARDDOOM2_INTR);
+
+	return IRQ_HANDLED;
+}
+
+static void doomdev2_ctx_deallocate(struct kref *kref) {
 	struct doomdev2_ctx *ctx = container_of(kref, struct doomdev2_ctx, kref);
 	kfree(ctx);
 }
@@ -198,7 +236,6 @@ static void doomdev2_dma_dealloc_buffer(struct doomdev2_dma_buffer *dma_buf) {
 static int doomdev2_dma_buffer_release(struct inode *_ino, struct file *filep) {
 	struct doomdev2_dma_buffer *dma_buf = (struct doomdev2_dma_buffer*) filep->private_data;
 
-	doomdev2_ctx_unregister_buffer(dma_buf);
 	doomdev2_dma_dealloc_buffer(dma_buf);
 
 	return 0;
@@ -411,6 +448,30 @@ static long doomdev2_ioctl_create_buffer(struct doomdev2_ctx *ctx, struct doomde
 	return doomdev2_dma_buffer_create(ctx, data_cb->size, data_cb->size, 0);
 }
 
+static void doomdev2_ctx_buffers_ref_count_manip(struct doomdev2_ctx_buffers *bufs, int diff) {
+	if (diff == +1) {
+		bufs->surf_dst    ? get_file(bufs->surf_dst->file) : 0;
+		bufs->surf_src    ? get_file(bufs->surf_src->file) : 0;
+		bufs->texture     ? get_file(bufs->texture->file) : 0;
+		bufs->flat        ? get_file(bufs->flat->file) : 0;
+		bufs->colormap    ? get_file(bufs->colormap->file) : 0;
+		bufs->translation ? get_file(bufs->translation->file) : 0;
+		bufs->tranmap     ? get_file(bufs->tranmap->file) : 0;
+	}
+	else if (diff == -1) {
+		bufs->surf_dst    ? fput(bufs->surf_dst->file) : 0;
+		bufs->surf_src    ? fput(bufs->surf_src->file) : 0;
+		bufs->texture     ? fput(bufs->texture->file) : 0;
+		bufs->flat        ? fput(bufs->flat->file) : 0;
+		bufs->colormap    ? fput(bufs->colormap->file) : 0;
+		bufs->translation ? fput(bufs->translation->file) : 0;
+		bufs->tranmap     ? fput(bufs->tranmap->file) : 0;
+	}
+	else {
+		BUG();
+	}
+}
+
 static long doomdev2_ioctl_setup(struct doomdev2_ctx *ctx, struct doomdev2_ioctl_setup *data_s) {
 	int ret = 0;
 	typeof(ctx->active_bufs) tmp_bufs;
@@ -473,9 +534,9 @@ static long doomdev2_ioctl_setup(struct doomdev2_ctx *ctx, struct doomdev2_ioctl
 	DOOMDEV2_FD_CHECK(surf_dst,    true,  1, false);
 	DOOMDEV2_FD_CHECK(surf_src,    true,  1, false);
 	DOOMDEV2_FD_CHECK(texture,     false, 1, false);
-	DOOMDEV2_FD_CHECK(flat,        false, DOOMDEV2_BUFFER_FLAT_ALIGNMENT,     false);
-	DOOMDEV2_FD_CHECK(colormap,    false, DOOMDEV2_BUFFER_COLORMAP_ALIGNMENT, false);
-	DOOMDEV2_FD_CHECK(translation, false, DOOMDEV2_BUFFER_COLORMAP_ALIGNMENT, false);
+	DOOMDEV2_FD_CHECK(flat,        false, DOOMDEV2_BUFFER_FLAT_SIZE,     false);
+	DOOMDEV2_FD_CHECK(colormap,    false, DOOMDEV2_BUFFER_COLORMAP_SIZE, false);
+	DOOMDEV2_FD_CHECK(translation, false, DOOMDEV2_BUFFER_COLORMAP_SIZE, false);
 	DOOMDEV2_FD_CHECK(tranmap,     false, DOOMDEV2_BUFFER_TRANMAP_SIZE, true);
 #undef DOOMDEV2_FD_CHECK
 
@@ -486,22 +547,10 @@ static long doomdev2_ioctl_setup(struct doomdev2_ctx *ctx, struct doomdev2_ioctl
 	}
 
 	// increase ref count on new context
-	tmp_bufs.surf_dst    ? get_file(tmp_bufs.surf_dst->file) : 0;
-	tmp_bufs.surf_src    ? get_file(tmp_bufs.surf_src->file) : 0;
-	tmp_bufs.texture     ? get_file(tmp_bufs.texture->file) : 0;
-	tmp_bufs.flat        ? get_file(tmp_bufs.flat->file) : 0;
-	tmp_bufs.colormap    ? get_file(tmp_bufs.colormap->file) : 0;
-	tmp_bufs.translation ? get_file(tmp_bufs.translation->file) : 0;
-	tmp_bufs.tranmap     ? get_file(tmp_bufs.tranmap->file) : 0;
+	doomdev2_ctx_buffers_ref_count_manip(&tmp_bufs, +1);
 
 	// then decrease ref count on old context
-	ctx->active_bufs.surf_dst    ? fput(ctx->active_bufs.surf_dst->file) : 0;
-	ctx->active_bufs.surf_src    ? fput(ctx->active_bufs.surf_src->file) : 0;
-	ctx->active_bufs.texture     ? fput(ctx->active_bufs.texture->file) : 0;
-	ctx->active_bufs.flat        ? fput(ctx->active_bufs.flat->file) : 0;
-	ctx->active_bufs.colormap    ? fput(ctx->active_bufs.colormap->file) : 0;
-	ctx->active_bufs.translation ? fput(ctx->active_bufs.translation->file) : 0;
-	ctx->active_bufs.tranmap     ? fput(ctx->active_bufs.tranmap->file) : 0;
+	doomdev2_ctx_buffers_ref_count_manip(&ctx->active_bufs, -1);
 
 	// set them as active buffers in ctx
 	ctx->active_bufs = tmp_bufs;
@@ -579,6 +628,11 @@ static int doomdev2_open(struct inode *ino, struct file *filep) {
 
 static int doomdev2_release(struct inode *_ino, struct file *filep) {
 	struct doomdev2_ctx *ctx = (struct doomdev2_ctx*) filep->private_data;
+
+	mutex_lock(&ctx->active_bufs_mutex); // we can't fail in destructor & theoretically no one should access this no more
+	doomdev2_ctx_buffers_ref_count_manip(&ctx->active_bufs, -1);
+	mutex_unlock(&ctx->active_bufs_mutex);
+
 	kref_put(&ctx->kref, doomdev2_ctx_deallocate);
 
 	filep->private_data = NULL;
@@ -588,11 +642,16 @@ static int doomdev2_release(struct inode *_ino, struct file *filep) {
 
 static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct harddoom2_cmd_buf *buf_cmd,
 		struct doomdev2_cmd *dev_cmd) {
-	struct doomdev2_dma_buffer *surf_dst = ctx->pddata->last_active_bufs.surf_dst;
+	struct doomdev2_ctx_buffers *bufs = &ctx->active_bufs; // assumption: the mutex is locked
 	uint16_t width, height;
 	uint16_t x_a, y_a, x_b, y_b;
+	uint32_t flags;
+	uint16_t translation_idx, colormap_idx/*, flat_idx*/;
+	uint16_t texture_limit;
 
 	memset(buf_cmd, 0, sizeof(*buf_cmd));
+
+#define HARDDOOM2_ENSURE(cond) if (!(cond)) { return -EINVAL; }
 
 	switch (dev_cmd->type) {
 	case DOOMDEV2_CMD_TYPE_COPY_RECT:
@@ -604,11 +663,11 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 		width = dev_cmd->fill_rect.width;
 		height = dev_cmd->fill_rect.height;
 
-		if (!surf_dst || x_a >= surf_dst->width || y_a >= surf_dst->height || width == 0 || height == 0) {
-			return -EINVAL;
-		}
-		width = min(width, (uint16_t) (surf_dst->width - x_a));
-		height = min(height, (uint16_t) (surf_dst->height - y_a));
+		HARDDOOM2_ENSURE(bufs->surf_dst
+			&& x_a < bufs->surf_dst->width && y_a < bufs->surf_dst->height
+			&& width > 0 && height > 0);
+		width = min(width, (uint16_t) (bufs->surf_dst->width - x_a));
+		height = min(height, (uint16_t) (bufs->surf_dst->height - y_a));
 
 		buf_cmd->w[0] = HARDDOOM2_CMD_TYPE_FILL_RECT;
 		buf_cmd->w[2] = HARDDOOM2_CMD_W2(x_a, y_a, 0);
@@ -621,10 +680,9 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 		x_b = dev_cmd->draw_line.pos_b_x;
 		y_b = dev_cmd->draw_line.pos_b_y;
 
-		if (!surf_dst || x_a >= surf_dst->width || y_a >= surf_dst->height
-				|| x_b >= surf_dst->width || y_b >= surf_dst->height) {
-			return -EINVAL;
-		}
+		HARDDOOM2_ENSURE(bufs->surf_dst
+			&& x_a < bufs->surf_dst->width && y_a < bufs->surf_dst->height
+			&& x_b < bufs->surf_dst->width && y_b < bufs->surf_dst->height);
 
 		buf_cmd->w[0] = HARDDOOM2_CMD_TYPE_DRAW_LINE;
 		buf_cmd->w[2] = HARDDOOM2_CMD_W2(x_a, y_a, 0);
@@ -636,17 +694,93 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 		break;
 
 	case DOOMDEV2_CMD_TYPE_DRAW_COLUMN:
+		x_a = x_b = dev_cmd->draw_column.pos_x;
+		y_a = dev_cmd->draw_column.pos_a_y;
+		y_b = dev_cmd->draw_column.pos_b_y;
+		flags = 0;
+		translation_idx = colormap_idx = 0;
+
+		HARDDOOM2_ENSURE(bufs->surf_dst && bufs->texture);
+		HARDDOOM2_ENSURE(x_a < bufs->surf_dst->width
+			&& y_a <= y_b && y_b < bufs->surf_dst->height);
+
+		texture_limit = (bufs->texture->width - 1) / HARDDOOM2_TEXTURE_LIMIT_UNITS;
+
+		if (dev_cmd->draw_column.flags & DOOMDEV2_CMD_FLAGS_TRANSLATE) {
+			flags |= HARDDOOM2_CMD_FLAG_TRANSLATION;
+			translation_idx = dev_cmd->draw_column.translation_idx;
+			HARDDOOM2_ENSURE(bufs->translation
+				&& translation_idx * DOOMDEV2_BUFFER_COLORMAP_SIZE < bufs->translation->width);
+		}
+		if (dev_cmd->draw_column.flags & DOOMDEV2_CMD_FLAGS_COLORMAP) {
+			flags |= HARDDOOM2_CMD_FLAG_COLORMAP;
+			colormap_idx = dev_cmd->draw_column.colormap_idx;
+			HARDDOOM2_ENSURE(bufs->colormap
+				&& colormap_idx * DOOMDEV2_BUFFER_COLORMAP_SIZE < bufs->colormap->width);
+		}
+		if (dev_cmd->draw_column.flags & DOOMDEV2_CMD_FLAGS_TRANMAP) {
+			flags |= HARDDOOM2_CMD_FLAG_TRANMAP;
+			HARDDOOM2_ENSURE(bufs->tranmap);
+		}
+
+		buf_cmd->w[0] = DOOMDEV2_CMD_TYPE_DRAW_COLUMN | flags;
+		buf_cmd->w[1] = HARDDOOM2_CMD_W1(translation_idx, colormap_idx);
+		buf_cmd->w[2] = HARDDOOM2_CMD_W2(x_a, y_a, 0);
+		buf_cmd->w[3] = HARDDOOM2_CMD_W3(x_b, y_b);
+		buf_cmd->w[4] = dev_cmd->draw_column.ustart; // todo validate (how?)
+		buf_cmd->w[5] = dev_cmd->draw_column.ustep;  // todo validate (how?)
+		buf_cmd->w[6] = HARDDOOM2_CMD_W6_B_EXTR_TEXTURE_OFFSET(dev_cmd->draw_column.texture_offset);
+		buf_cmd->w[7] = HARDDOOM2_CMD_W7_B(texture_limit, dev_cmd->draw_column.texture_height);
 		break;
 
-	case DOOMDEV2_CMD_TYPE_DRAW_SPAN:
+	case DOOMDEV2_CMD_TYPE_DRAW_SPAN: // todo (!!!) debug PAGE_FAULT_TEXTURE (make page table read only, and fix page table ('twas working before refactor))
+		// y_a = y_b = dev_cmd->draw_span.pos_y;
+		// x_a = dev_cmd->draw_span.pos_a_x;
+		// x_b = dev_cmd->draw_span.pos_b_x;
+		// flat_idx = dev_cmd->draw_span.flat_idx;
+		// flags = 0;
+		// translation_idx = colormap_idx = 0;
+
+		// HARDDOOM2_ENSURE(bufs->surf_dst && bufs->flat);
+		// HARDDOOM2_ENSURE(x_a <= x_b && x_b < bufs->surf_dst->width
+		// 	&& y_a < bufs->surf_dst->height);
+		// HARDDOOM2_ENSURE(flat_idx * DOOMDEV2_BUFFER_FLAT_SIZE < bufs->flat->width);
+
+		// if (dev_cmd->draw_span.flags & DOOMDEV2_CMD_FLAGS_TRANSLATE) {
+		// 	flags |= HARDDOOM2_CMD_FLAG_TRANSLATION;
+		// 	translation_idx = dev_cmd->draw_span.translation_idx;
+		// 	HARDDOOM2_ENSURE(bufs->translation
+		// 		&& translation_idx * DOOMDEV2_BUFFER_COLORMAP_SIZE < bufs->translation->width);
+		// }
+		// if (dev_cmd->draw_span.flags & DOOMDEV2_CMD_FLAGS_COLORMAP) {
+		// 	flags |= HARDDOOM2_CMD_FLAG_COLORMAP;
+		// 	colormap_idx = dev_cmd->draw_span.colormap_idx;
+		// 	HARDDOOM2_ENSURE(bufs->colormap
+		// 		&& colormap_idx * DOOMDEV2_BUFFER_COLORMAP_SIZE < bufs->colormap->width);
+		// }
+		// if (dev_cmd->draw_span.flags & DOOMDEV2_CMD_FLAGS_TRANMAP) {
+		// 	flags |= HARDDOOM2_CMD_FLAG_TRANMAP;
+		// 	HARDDOOM2_ENSURE(bufs->tranmap);
+		// }
+
+		// buf_cmd->w[0] = DOOMDEV2_CMD_TYPE_DRAW_SPAN | flags;
+		// buf_cmd->w[1] = HARDDOOM2_CMD_W1(translation_idx, colormap_idx);
+		// buf_cmd->w[2] = HARDDOOM2_CMD_W2(x_a, y_a, flat_idx);
+		// buf_cmd->w[3] = HARDDOOM2_CMD_W3(x_b, y_b);
+		// buf_cmd->w[4] = dev_cmd->draw_span.ustart; // todo validate (how?)
+		// buf_cmd->w[5] = dev_cmd->draw_span.ustep;  // todo validate (how?)
+		// buf_cmd->w[6] = dev_cmd->draw_span.vstart; // todo validate (how?)
+		// buf_cmd->w[7] = dev_cmd->draw_span.vstep;  // todo validate (how?)
 		break;
 
 	case DOOMDEV2_CMD_TYPE_DRAW_FUZZ:
 		break;
 	}
 
+#undef HARDDOOM2_ENSURE
+
 	// todo delete later; tmp filler
-	if (buf_cmd->w[0]) {
+	if (!buf_cmd->w[0]) {
 		buf_cmd->w[0] = HARDDOOM2_CMD_TYPE_SETUP;
 	}
 
@@ -659,8 +793,38 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 static inline void harddoom2_send_cmd(struct harddoom2_pcidevdata *pddata, struct harddoom2_cmd_buf *buf) {
 	int i;
 
-	for (i = 0; i < HARDDOOM2_CMD_SIZE_IN_WORDS; i++) {
+	for (i = 0; i < HARDDOOM2_CMD_SEND_SIZE; i++) {
 		iowrite32(buf->w[i], pddata->bar0 + HARDDOOM2_CMD_SEND(i)); // happily assuming there's space (todo fix)
+	}
+}
+
+static void harddoom2_handle_intr_errors(struct harddoom2_pcidevdata *pddata) {
+	static const char *errors[] = {
+		"FE_ERROR",
+		"CMD_OVERFLOW",
+		"SURF_DST_OVERFLOW",
+		"SURF_SRC_OVERFLOW",
+		"PAGE_FAULT_CMD",
+		"PAGE_FAULT_SURF_DST",
+		"PAGE_FAULT_SURF_SRC",
+		"PAGE_FAULT_TEXTURE",
+		"PAGE_FAULT_FLAT",
+		"PAGE_FAULT_TRANSLATION",
+		"PAGE_FAULT_COLORMAP",
+		"PAGE_FAULT_TRANMAP",
+	};
+	uint32_t flags = 0;
+	int i;
+
+	// todo make these two atomic
+	flags = harddoom2_intr_error_flags;
+	harddoom2_intr_error_flags = 0;
+
+	for (i = 0; i < HARDDOOM2_INTR_ERRORS_CNT; i++) {
+		if (flags & HARDDOOM2_INTR_ERROR(i)) {
+			dev_err(&pddata->pdev->dev, "Error: %s\n", errors[i]);
+			// flags &= ~HARDDOOM2_INTR_ERROR(i); // todo remove
+		}
 	}
 }
 
@@ -670,6 +834,8 @@ static ssize_t doomdev2_write(struct file *filep, const char __user *user_buff, 
 	struct doomdev2_cmd dev_cmd;
 	uint32_t flags, sdwidth, sswidth;
 	ssize_t ret;
+
+	harddoom2_handle_intr_errors(ctx->pddata);
 
 	if (*offp != 0 || count % sizeof(struct doomdev2_cmd) != 0) {
 		return -EINVAL;
@@ -714,7 +880,6 @@ static ssize_t doomdev2_write(struct file *filep, const char __user *user_buff, 
 	cmd_buf.w[0] = HARDDOOM2_CMD_W0_SETUP(HARDDOOM2_CMD_TYPE_SETUP, flags, sdwidth, sswidth);
 #undef HARDDOOM2_SETUP_HELPER
 
-	mutex_unlock(&ctx->active_bufs_mutex);
 	harddoom2_send_cmd(ctx->pddata, &cmd_buf);
 
 	// process command by command
@@ -740,8 +905,16 @@ static ssize_t doomdev2_write(struct file *filep, const char __user *user_buff, 
 		ret += sizeof(dev_cmd);
 	}
 
+	// we need to access active buffers while validating commands
+	// todo (optimization) -- make a copy, and remember about ref counts!
+	mutex_unlock(&ctx->active_bufs_mutex);
+
 	// wait until commands are processed
-	// todo (!!!)
+	memset(&cmd_buf, 0, sizeof(cmd_buf));
+	cmd_buf.w[0] = HARDDOOM2_CMD_W0_SETUP(HARDDOOM2_CMD_TYPE_SETUP,
+		HARDDOOM2_CMD_FLAG_INTERLOCK | HARDDOOM2_CMD_FLAG_PING_SYNC, 0, 0);
+	harddoom2_send_cmd(ctx->pddata, &cmd_buf);
+	wait_for_completion(&ctx->pddata->pong_sync);
 
 exit_op:
 	mutex_unlock(&ctx->pddata->sync_queue_mutex);
@@ -822,6 +995,7 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 	pddata->bar0 = bar0;
 	memset(&pddata->last_active_bufs, 0, sizeof(pddata->last_active_bufs));
 	mutex_init(&pddata->sync_queue_mutex);
+	init_completion(&pddata->pong_sync);
 	pci_set_drvdata(pdev, pddata);
 
 	// set up dma
@@ -837,6 +1011,13 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 		goto err_2;
 	}
 
+	// register interruption handler
+	ret = request_irq(pdev->irq, harddoom2_irq_handler, IRQF_SHARED, harddoom2_name, pddata);
+	if (ret) {
+		dev_err(&pdev->dev, "Failed: request_irq");
+		goto err_2;
+	}
+
 	// boot sequence
 	iowrite32(0, bar0 + HARDDOOM2_FE_CODE_ADDR);
 	code_size = ARRAY_SIZE(doomcode2);
@@ -846,7 +1027,7 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 	iowrite32(HARDDOOM2_RESET_ALL, bar0 + HARDDOOM2_RESET);
 	// todo init CMD_PT, CMD_SIZE and CMD_*_IDX,
 	iowrite32(HARDDOOM2_INTR_MASK, bar0 + HARDDOOM2_INTR);
-	// todo init INTR_ENABLE (0 by default)
+	iowrite32(HARDDOOM2_INTR_MASK, bar0 + HARDDOOM2_INTR_ENABLE);
 	// todo init FENCE_COUNTER
 	iowrite32(HARDDOOM2_ENABLE_ALL & ~HARDDOOM2_ENABLE_CMD_FETCH, bar0 + HARDDOOM2_ENABLE);
 
@@ -881,6 +1062,7 @@ err_3:
 	iowrite32(0, pddata->bar0 + HARDDOOM2_ENABLE);
 	iowrite32(0, pddata->bar0 + HARDDOOM2_INTR_ENABLE);
 	ioread32(pddata->bar0 + HARDDOOM2_ENABLE);
+	free_irq(pdev->irq, pddata);
 err_2:
 	pci_clear_master(pdev);
 	kfree(pddata);
@@ -900,6 +1082,7 @@ static void harddoom2_remove(struct pci_dev *pdev) {
 	iowrite32(0, pddata->bar0 + HARDDOOM2_ENABLE);
 	iowrite32(0, pddata->bar0 + HARDDOOM2_INTR_ENABLE);
 	ioread32(pddata->bar0 + HARDDOOM2_ENABLE);
+	free_irq(pddata->pdev->irq, pddata);
 
 	// destroy chrdev
 	device_destroy(&doomdev2_class, pddata->doomdev2.dev);
