@@ -70,6 +70,7 @@ struct doomdev2_ctx_buffers {
 	struct doomdev2_dma_buffer *translation;
 	struct doomdev2_dma_buffer *tranmap;
 };
+#define DOOMDEV2_CTX_BUFFERS_CNT (sizeof(struct doomdev2_ctx_buffers) / sizeof(struct doomdev2_ctx_buffers*))
 
 struct harddoom2_pcidevdata {
 	struct pci_dev *pdev;
@@ -83,9 +84,6 @@ struct harddoom2_pcidevdata {
 
 struct doomdev2_ctx {
 	struct harddoom2_pcidevdata *pddata;
-	struct list_head buffers;
-	struct mutex buffers_mutex; // todo some RW lock instead?
-	struct kref kref;
 
 	struct doomdev2_ctx_buffers active_bufs;
 	struct mutex active_bufs_mutex;
@@ -101,9 +99,7 @@ struct doomdev2_dma_buffer {
 	struct doomdev2_ctx *ctx;
 	int32_t width;
 	int32_t height; // if zero, then it's a buffer, not a surface
-	int32_t fd;
 	struct file *file;
-	struct list_head list;
 
 	size_t pages_cnt;
 	struct doomdev2_dma_page pages[0];
@@ -148,34 +144,6 @@ static irqreturn_t harddoom2_irq_handler(int _irq, void *dev) {
 	return IRQ_HANDLED;
 }
 
-static void doomdev2_ctx_deallocate(struct kref *kref) {
-	struct doomdev2_ctx *ctx = container_of(kref, struct doomdev2_ctx, kref);
-	kfree(ctx);
-}
-
-static int doomdev2_ctx_register_buffer(struct doomdev2_ctx *ctx, struct doomdev2_dma_buffer *dma_buf) {
-	int ret = 0;
-
-	ret = mutex_lock_interruptible(&ctx->buffers_mutex);
-	if (ret) {
-		return ret;
-	}
-	list_add_tail(&dma_buf->list, &ctx->buffers);
-	mutex_unlock(&ctx->buffers_mutex);
-
-	kref_get(&ctx->kref);
-
-	return ret;
-}
-
-static void doomdev2_ctx_unregister_buffer(struct doomdev2_dma_buffer *dma_buf) {
-	mutex_lock(&dma_buf->ctx->buffers_mutex); // better not to fail in destructor
-	list_del(&dma_buf->list);
-	mutex_unlock(&dma_buf->ctx->buffers_mutex);
-
-	kref_put(&dma_buf->ctx->kref, doomdev2_ctx_deallocate);
-}
-
 static struct doomdev2_dma_buffer *doomdev2_dma_alloc_buffer(struct doomdev2_ctx *ctx, size_t pages_cnt) {
 	struct doomdev2_dma_buffer *dma_buf;
 	size_t alloc_size;
@@ -190,9 +158,7 @@ static struct doomdev2_dma_buffer *doomdev2_dma_alloc_buffer(struct doomdev2_ctx
 	dma_buf->ctx = ctx;
 	dma_buf->width = DOOMDEV2_DMA_BUFFER_NO_VALUE;   // set later in other function
 	dma_buf->height = DOOMDEV2_DMA_BUFFER_NO_VALUE;  // ^
-	dma_buf->fd = DOOMDEV2_DMA_BUFFER_NO_VALUE;      // ^
 	dma_buf->file = NULL;
-	INIT_LIST_HEAD(&dma_buf->list);
 	dma_buf->pages_cnt = pages_cnt;
 
 	// alloc pages
@@ -224,10 +190,6 @@ static void doomdev2_dma_dealloc_buffer(struct doomdev2_dma_buffer *dma_buf) {
 	pages_end = dma_buf->pages + dma_buf->pages_cnt;
 	for (page_it = dma_buf->pages; page_it < pages_end; page_it++) {
 		dma_free_coherent(&dma_buf->ctx->pddata->pdev->dev, HARDDOOM2_PAGE_SIZE, page_it->phys_addr, page_it->dma_handle);
-	}
-
-	if (dma_buf->fd != DOOMDEV2_DMA_BUFFER_NO_VALUE) { // todo how about cmd buffer?
-		doomdev2_ctx_unregister_buffer(dma_buf);
 	}
 
 	kfree(dma_buf);
@@ -362,14 +324,8 @@ static int doomdev2_dma_alloc_install_fd(struct doomdev2_dma_buffer *dma_buf) {
 		goto err_put_unused_fd;
 	}
 
-	dma_buf->fd = fd;
 	dma_buf->file = f;
 	f->f_mode |= FMODE_LSEEK | FMODE_PREAD | FMODE_PWRITE;
-
-	err = doomdev2_ctx_register_buffer(dma_buf->ctx, dma_buf);
-	if (err) {
-		goto err_put_unused_fd;
-	}
 
 	fd_install(fd, f);
 
@@ -475,38 +431,37 @@ static void doomdev2_ctx_buffers_ref_count_manip(struct doomdev2_ctx_buffers *bu
 static long doomdev2_ioctl_setup(struct doomdev2_ctx *ctx, struct doomdev2_ioctl_setup *data_s) {
 	int ret = 0;
 	typeof(ctx->active_bufs) tmp_bufs;
+	struct fd fds[DOOMDEV2_CTX_BUFFERS_CNT];
+	int i;
 
-	inline struct doomdev2_dma_buffer *find_fd(int32_t fd) {
-		// assumption: buffers_mutex is locked
-		struct doomdev2_dma_buffer *it;
-
-		list_for_each_entry(it, &ctx->buffers, list) {
-			if (it->fd == fd) {
-				return it;
-			}
-		}
-
-		return NULL;
-	}
-
-	inline int validate_set_buf(struct doomdev2_dma_buffer **dst, int32_t fd,
+	inline int validate_set_buf(struct doomdev2_dma_buffer **dst, int32_t fd, struct fd *fd_out,
 			bool is_surface, size_t size_divider, bool exact_size) {
 		struct doomdev2_dma_buffer *dma_buf;
+		struct fd f;
+		int err;
 
 		if (fd != -1) {
 			size_t size;
-			dma_buf = find_fd(fd);
-			if (!dma_buf) {
-				return -EINVAL;
+			f = fdget(fd);
+			if (!f.file) {
+				return -EBADF;
 			}
+			if (f.file->f_op != &doomdev2_dma_buffer_fops) {
+				err = -EINVAL;
+				goto err_fdput;
+			}
+			dma_buf = (struct doomdev2_dma_buffer*) f.file->private_data;
 			if (is_surface ? dma_buf->height <= 0 : dma_buf->height > 0) {
-				return -EINVAL;
+				err = -EINVAL;
+				goto err_fdput;
 			}
 			size = DOOMDEV2_DMA_BUFFER_SIZE(dma_buf);
 			if (exact_size ? size != size_divider : size % size_divider != 0) {
-				return -EINVAL;
+				err = -EINVAL;
+				goto err_fdput;
 			}
 			// alignment is ensured by dma_alloc_coherent
+			*fd_out = f; // dma_buf is okay, fd need to be released by caller
 		}
 		else {
 			dma_buf = NULL;
@@ -514,36 +469,36 @@ static long doomdev2_ioctl_setup(struct doomdev2_ctx *ctx, struct doomdev2_ioctl
 
 		*dst = dma_buf;
 		return 0;
-	}
 
-	ret = mutex_lock_interruptible(&ctx->buffers_mutex);
-	if (ret) {
-		return ret;
+	err_fdput:
+		fdput(f);
+		return err;
 	}
 
 	memset(&tmp_bufs, 0, sizeof(tmp_bufs));
+	memset(fds, 0, sizeof(fds));
 
 	// validate fds
-#define DOOMDEV2_FD_CHECK(buf_name, ...) do { \
-		ret = validate_set_buf(&tmp_bufs.buf_name, data_s->buf_name##_fd, __VA_ARGS__); \
+#define DOOMDEV2_FD_CHECK(buf_name, no, ...) do { \
+		ret = validate_set_buf(&tmp_bufs.buf_name, data_s->buf_name##_fd, fds + (no), __VA_ARGS__); \
 		if (ret) { \
-			goto err_unlock_buffers; \
+			goto exit_release_fds; \
 		} \
 	} while (0)
 
-	DOOMDEV2_FD_CHECK(surf_dst,    true,  1, false);
-	DOOMDEV2_FD_CHECK(surf_src,    true,  1, false);
-	DOOMDEV2_FD_CHECK(texture,     false, 1, false);
-	DOOMDEV2_FD_CHECK(flat,        false, DOOMDEV2_BUFFER_FLAT_SIZE,     false);
-	DOOMDEV2_FD_CHECK(colormap,    false, DOOMDEV2_BUFFER_COLORMAP_SIZE, false);
-	DOOMDEV2_FD_CHECK(translation, false, DOOMDEV2_BUFFER_COLORMAP_SIZE, false);
-	DOOMDEV2_FD_CHECK(tranmap,     false, DOOMDEV2_BUFFER_TRANMAP_SIZE, true);
+	DOOMDEV2_FD_CHECK(surf_dst,    0, true,  1, false);
+	DOOMDEV2_FD_CHECK(surf_src,    1, true,  1, false);
+	DOOMDEV2_FD_CHECK(texture,     2, false, 1, false);
+	DOOMDEV2_FD_CHECK(flat,        3, false, DOOMDEV2_BUFFER_FLAT_SIZE,     false);
+	DOOMDEV2_FD_CHECK(colormap,    4, false, DOOMDEV2_BUFFER_COLORMAP_SIZE, false);
+	DOOMDEV2_FD_CHECK(translation, 5, false, DOOMDEV2_BUFFER_COLORMAP_SIZE, false);
+	DOOMDEV2_FD_CHECK(tranmap,     6, false, DOOMDEV2_BUFFER_TRANMAP_SIZE, true);
 #undef DOOMDEV2_FD_CHECK
 
 	// symbolic context switch (change active buffers, not send SETUP command)
 	ret = mutex_lock_interruptible(&ctx->active_bufs_mutex);
 	if (ret) {
-		goto err_unlock_buffers;
+		goto exit_release_fds;
 	}
 
 	// increase ref count on new context
@@ -557,8 +512,12 @@ static long doomdev2_ioctl_setup(struct doomdev2_ctx *ctx, struct doomdev2_ioctl
 
 	mutex_unlock(&ctx->active_bufs_mutex);
 
-err_unlock_buffers:
-	mutex_unlock(&ctx->buffers_mutex);
+exit_release_fds:
+	for (i = 0; i < DOOMDEV2_CTX_BUFFERS_CNT; i++) {
+		if (fds[i].file) { // not empty
+			fdput(fds[i]);
+		}
+	}
 
 	return ret;
 }
@@ -615,9 +574,6 @@ static int doomdev2_open(struct inode *ino, struct file *filep) {
 
 	pddata = container_of(ino->i_cdev, struct harddoom2_pcidevdata, doomdev2);
 	ctx->pddata = pddata;
-	INIT_LIST_HEAD(&ctx->buffers);
-	mutex_init(&ctx->buffers_mutex);
-	kref_init(&ctx->kref);
 	memset(&ctx->active_bufs, 0, sizeof(ctx->active_bufs));
 	mutex_init(&ctx->active_bufs_mutex);
 
@@ -633,7 +589,7 @@ static int doomdev2_release(struct inode *_ino, struct file *filep) {
 	doomdev2_ctx_buffers_ref_count_manip(&ctx->active_bufs, -1);
 	mutex_unlock(&ctx->active_bufs_mutex);
 
-	kref_put(&ctx->kref, doomdev2_ctx_deallocate);
+	kfree(ctx);
 
 	filep->private_data = NULL;
 
