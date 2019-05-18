@@ -1,5 +1,6 @@
 // TODO remove unused headers
-// TODO refactor: change names to better ones
+// TODO check last year's scoring
+// TODO interlock use when necessary
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/ioctl.h>
@@ -55,7 +56,6 @@ static struct class doomdev2_class = {
 };
 static DECLARE_BITMAP(doomdev2_used_minors, HARDDOOM2_MAX_DEVICES);
 static DEFINE_MUTEX(doomdev2_used_minors_mutex);
-static uint32_t harddoom2_intr_error_flags;
 
 
 struct doomdev2_ctx_buffers {
@@ -69,11 +69,14 @@ struct doomdev2_ctx_buffers {
 };
 #define DOOMDEV2_CTX_BUFFERS_CNT (sizeof(struct doomdev2_ctx_buffers) / sizeof(struct doomdev2_ctx_buffers*))
 
-struct harddoom2_pcidevdata {
+struct harddoom2_device {
 	struct pci_dev *pdev;
 	void __iomem *bar0;
 	struct cdev doomdev2;
+
 	struct doomdev2_dma_buffer *cmd_queue;
+	uint32_t cmd_write_idx;
+	uint32_t cmd_read_idx_cached;
 
 	struct doomdev2_ctx_buffers last_active_bufs; // note: NEVER deref pointers inside (we hold weak reference here)
 	struct mutex sync_queue_mutex; // used for sending to queue and operating on last_active_bufs member
@@ -81,7 +84,7 @@ struct harddoom2_pcidevdata {
 };
 
 struct doomdev2_ctx {
-	struct harddoom2_pcidevdata *pddata;
+	struct harddoom2_device *hdev;
 
 	struct doomdev2_ctx_buffers active_bufs;
 	struct mutex active_bufs_mutex;
@@ -94,7 +97,7 @@ struct doomdev2_dma_page {
 
 // represents surfaces and buffers
 struct doomdev2_dma_buffer {
-	struct doomdev2_ctx *ctx;
+	struct harddoom2_device *hdev;
 	int32_t width;
 	int32_t height; // if zero, then it's a buffer, not a surface
 	struct file *file;
@@ -108,13 +111,29 @@ struct doomdev2_dma_buffer {
 struct harddoom2_cmd_buf {
 	uint32_t w[HARDDOOM2_CMD_SEND_SIZE];
 };
+#define HARDDOOM2_MAX_CMD_CNT	(DOOMDEV2_MAX_BUFFER_SIZE / sizeof(struct harddoom2_cmd_buf))
 
 static irqreturn_t harddoom2_irq_handler(int _irq, void *dev) {
-	struct harddoom2_pcidevdata *pddata = (struct harddoom2_pcidevdata*) dev;
+	static const char *errors[] = {
+		"FE_ERROR",
+		"CMD_OVERFLOW",
+		"SURF_DST_OVERFLOW",
+		"SURF_SRC_OVERFLOW",
+		"PAGE_FAULT_CMD",
+		"PAGE_FAULT_SURF_DST",
+		"PAGE_FAULT_SURF_SRC",
+		"PAGE_FAULT_TEXTURE",
+		"PAGE_FAULT_FLAT",
+		"PAGE_FAULT_TRANSLATION",
+		"PAGE_FAULT_COLORMAP",
+		"PAGE_FAULT_TRANMAP",
+	};
+	struct harddoom2_device *hdev = (struct harddoom2_device*) dev;
 	uint32_t flags, error_flags;
+	int i;
 
 	// read interruptions
-	flags = ioread32(pddata->bar0 + HARDDOOM2_INTR);
+	flags = ioread32(hdev->bar0 + HARDDOOM2_INTR);
 	if (!flags) {
 		return IRQ_NONE;
 	}
@@ -122,26 +141,35 @@ static irqreturn_t harddoom2_irq_handler(int _irq, void *dev) {
 	// handle interruptions
 	if (flags & HARDDOOM2_INTR_FENCE) {
 		// todo
+		BUG();
 	}
 
 	if (flags & HARDDOOM2_INTR_PONG_SYNC) {
-		complete(&pddata->pong_sync);
+		iowrite32(HARDDOOM2_INTR_PONG_SYNC, hdev->bar0 + HARDDOOM2_INTR);
+		complete(&hdev->pong_sync);
 	}
 
 	if (flags & HARDDOOM2_INTR_PONG_ASYNC) {
 		// todo
+		BUG();
 	}
 
+	// handle errors
 	error_flags = flags & HARDDOOM2_INTR_ERRORS_MASK;
-	__atomic_or_fetch(&harddoom2_intr_error_flags, error_flags, __ATOMIC_SEQ_CST);
-
-	// disable interruptions (mark as done) on harddoom2
-	iowrite32(flags, pddata->bar0 + HARDDOOM2_INTR);
+	if (error_flags) {
+		for (i = 0; i < HARDDOOM2_INTR_ERRORS_CNT; i++) {
+			if (error_flags & HARDDOOM2_INTR_ERROR(i)) {
+				dev_err(&hdev->pdev->dev, "Error: %s\n", errors[i]);
+			}
+		}
+		iowrite32(error_flags, hdev->bar0 + HARDDOOM2_INTR);
+		BUG();
+	}
 
 	return IRQ_HANDLED;
 }
 
-static struct doomdev2_dma_buffer *doomdev2_dma_buffer_alloc(struct doomdev2_ctx *ctx, size_t pages_cnt) {
+static struct doomdev2_dma_buffer *doomdev2_dma_buffer_alloc(struct harddoom2_device *hdev, size_t pages_cnt) {
 	struct doomdev2_dma_buffer *dma_buf;
 	size_t alloc_size;
 	struct doomdev2_dma_page *page_it, *pages_end;
@@ -152,7 +180,7 @@ static struct doomdev2_dma_buffer *doomdev2_dma_buffer_alloc(struct doomdev2_ctx
 	if (!dma_buf) {
 		return NULL;
 	}
-	dma_buf->ctx = ctx;
+	dma_buf->hdev = hdev;
 	dma_buf->width = DOOMDEV2_DMA_BUFFER_NO_VALUE;   // set later in other function
 	dma_buf->height = DOOMDEV2_DMA_BUFFER_NO_VALUE;  // ^
 	dma_buf->file = NULL;
@@ -161,7 +189,7 @@ static struct doomdev2_dma_buffer *doomdev2_dma_buffer_alloc(struct doomdev2_ctx
 	// alloc pages
 	pages_end = dma_buf->pages + pages_cnt;
 	for (page_it = dma_buf->pages; page_it < pages_end; page_it++) {
-		page_it->phys_addr = dma_alloc_coherent(&ctx->pddata->pdev->dev, HARDDOOM2_PAGE_SIZE,
+		page_it->phys_addr = dma_alloc_coherent(&hdev->pdev->dev, HARDDOOM2_PAGE_SIZE,
 			&page_it->dma_handle, GFP_KERNEL | __GFP_ZERO);
 		if (!page_it->phys_addr) {
 			goto dma_alloc_err;
@@ -174,7 +202,7 @@ static struct doomdev2_dma_buffer *doomdev2_dma_buffer_alloc(struct doomdev2_ctx
 
 dma_alloc_err:
 	for (page_it--; page_it >= dma_buf->pages; page_it--) {
-		dma_free_coherent(&ctx->pddata->pdev->dev, HARDDOOM2_PAGE_SIZE, page_it->phys_addr, page_it->dma_handle);
+		dma_free_coherent(&hdev->pdev->dev, HARDDOOM2_PAGE_SIZE, page_it->phys_addr, page_it->dma_handle);
 	}
 	kfree(dma_buf);
 
@@ -186,7 +214,7 @@ static void doomdev2_dma_buffer_del(struct doomdev2_dma_buffer *dma_buf) {
 
 	pages_end = dma_buf->pages + dma_buf->pages_cnt;
 	for (page_it = dma_buf->pages; page_it < pages_end; page_it++) {
-		dma_free_coherent(&dma_buf->ctx->pddata->pdev->dev, HARDDOOM2_PAGE_SIZE, page_it->phys_addr, page_it->dma_handle);
+		dma_free_coherent(&dma_buf->hdev->pdev->dev, HARDDOOM2_PAGE_SIZE, page_it->phys_addr, page_it->dma_handle);
 	}
 
 	kfree(dma_buf);
@@ -242,7 +270,7 @@ static ssize_t doomdev2_dma_buffer_io(struct file *filep, char __user *buff_read
 
 	BUG_ON((buff_read && buff_write) || (!buff_read && !buff_write));
 
-	ret = mutex_lock_interruptible(&dma_buf->ctx->pddata->sync_queue_mutex);
+	ret = mutex_lock_interruptible(&dma_buf->hdev->sync_queue_mutex);
 	if (ret) {
 		return ret;
 	}
@@ -283,7 +311,7 @@ static ssize_t doomdev2_dma_buffer_io(struct file *filep, char __user *buff_read
 	}
 
 exit_op:
-	mutex_unlock(&dma_buf->ctx->pddata->sync_queue_mutex);
+	mutex_unlock(&dma_buf->hdev->sync_queue_mutex);
 
 	return ret;
 }
@@ -349,14 +377,14 @@ static void doomdev2_dma_buffer_format_page_table(struct doomdev2_dma_buffer *dm
 	}
 }
 
-static long doomdev2_dma_buffer_alloc_with_fd(struct doomdev2_ctx *ctx, size_t dma_alloc_size, int32_t width, int32_t height) {
+static long doomdev2_dma_buffer_alloc_with_fd(struct harddoom2_device *hdev, size_t dma_alloc_size, int32_t width, int32_t height) {
 	int err;
 	size_t dma_pages_cnt;
 	struct doomdev2_dma_buffer *dma_buf;
 
 	dma_pages_cnt = DIV_ROUND_UP(dma_alloc_size, HARDDOOM2_PAGE_SIZE) + 1; // +1 for page table
 
-	dma_buf = doomdev2_dma_buffer_alloc(ctx, dma_pages_cnt);
+	dma_buf = doomdev2_dma_buffer_alloc(hdev, dma_pages_cnt);
 	if (!dma_buf) {
 		return -ENOMEM;
 	}
@@ -378,7 +406,7 @@ err_fd_alloc:
 	return err;
 }
 
-static long doomdev2_ioctl_create_surface(struct doomdev2_ctx *ctx, struct doomdev2_ioctl_create_surface *data_cs) {
+static long doomdev2_ioctl_create_surface(struct harddoom2_device *hdev, struct doomdev2_ioctl_create_surface *data_cs) {
 	size_t dma_alloc_size;
 
 	if (data_cs->width < DOOMDEV2_MIN_SURFACE_SIZE || data_cs->width > DOOMDEV2_MAX_SURFACE_SIZE
@@ -390,15 +418,15 @@ static long doomdev2_ioctl_create_surface(struct doomdev2_ctx *ctx, struct doomd
 	}
 	dma_alloc_size = data_cs->width * data_cs->height;
 
-	return doomdev2_dma_buffer_alloc_with_fd(ctx, dma_alloc_size, data_cs->width, data_cs->height);
+	return doomdev2_dma_buffer_alloc_with_fd(hdev, dma_alloc_size, data_cs->width, data_cs->height);
 }
 
-static long doomdev2_ioctl_create_buffer(struct doomdev2_ctx *ctx, struct doomdev2_ioctl_create_buffer *data_cb) {
+static long doomdev2_ioctl_create_buffer(struct harddoom2_device *hdev, struct doomdev2_ioctl_create_buffer *data_cb) {
 	if (data_cb->size < DOOMDEV2_MIN_BUFFER_SIZE || data_cb->size > DOOMDEV2_MAX_BUFFER_SIZE) {
 		return -EOVERFLOW;
 	}
 
-	return doomdev2_dma_buffer_alloc_with_fd(ctx, data_cb->size, data_cb->size, 0);
+	return doomdev2_dma_buffer_alloc_with_fd(hdev, data_cb->size, data_cb->size, 0);
 }
 
 static void doomdev2_ctx_buffers_ref_count_manip(struct doomdev2_ctx_buffers *bufs, int diff) {
@@ -448,6 +476,10 @@ static long doomdev2_ioctl_setup(struct doomdev2_ctx *ctx, struct doomdev2_ioctl
 				goto err_fdput;
 			}
 			dma_buf = (struct doomdev2_dma_buffer*) f.file->private_data;
+			if (dma_buf->hdev != ctx->hdev) {
+				err = -EINVAL;
+				goto err_fdput;
+			}
 			if (is_surface ? dma_buf->height <= 0 : dma_buf->height > 0) {
 				err = -EINVAL;
 				goto err_fdput;
@@ -534,14 +566,14 @@ static long doomdev2_ioctl(struct file *filep, unsigned int cmd, unsigned long a
 			if (ret) {
 				return -EFAULT;
 			}
-			ret = doomdev2_ioctl_create_surface(ctx, &data_cs);
+			ret = doomdev2_ioctl_create_surface(ctx->hdev, &data_cs);
 			break;
 		case DOOMDEV2_IOCTL_CREATE_BUFFER:
 			ret = copy_from_user(&data_cb, arg_ptr, sizeof(data_cb));
 			if (ret) {
 				return -EFAULT;
 			}
-			ret = doomdev2_ioctl_create_buffer(ctx, &data_cb);
+			ret = doomdev2_ioctl_create_buffer(ctx->hdev, &data_cb);
 			break;
 		case DOOMDEV2_IOCTL_SETUP:
 			ret = copy_from_user(&data_s, arg_ptr, sizeof(data_s));
@@ -554,23 +586,19 @@ static long doomdev2_ioctl(struct file *filep, unsigned int cmd, unsigned long a
 			ret = -ENOTTY;
 	}
 
-	if (IS_ERR_VALUE(ret)) {
-		dev_printk("debug", &ctx->pddata->pdev->dev, "dev ioctl, cmd=%x, ret=%lx", cmd, ret);
-	}
-
 	return ret;
 }
 
 static int doomdev2_open(struct inode *ino, struct file *filep) {
-	struct harddoom2_pcidevdata *pddata;
+	struct harddoom2_device *hdev;
 	struct doomdev2_ctx *ctx = (struct doomdev2_ctx*) kmalloc(sizeof(struct doomdev2_ctx), GFP_KERNEL);
 	if (!ctx) {
 		printk(KERN_ERR "harddoom2: Cannot allocate memory (doomdev2_open)\n");
 		return -ENOMEM;
 	}
 
-	pddata = container_of(ino->i_cdev, struct harddoom2_pcidevdata, doomdev2);
-	ctx->pddata = pddata;
+	hdev = container_of(ino->i_cdev, struct harddoom2_device, doomdev2);
+	ctx->hdev = hdev;
 	memset(&ctx->active_bufs, 0, sizeof(ctx->active_bufs));
 	mutex_init(&ctx->active_bufs_mutex);
 
@@ -791,45 +819,25 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 
 #undef HARDDOOM2_ENSURE
 
-	// todo tmp flag for sync code
+	// todo (!!!) tmp flag for sync code
 	buf_cmd->w[0] |= HARDDOOM2_CMD_FLAG_INTERLOCK;
 
 	return 0;
 }
 
-static void harddoom2_handle_intr_errors(struct harddoom2_pcidevdata *pddata) {
-	static const char *errors[] = {
-		"FE_ERROR",
-		"CMD_OVERFLOW",
-		"SURF_DST_OVERFLOW",
-		"SURF_SRC_OVERFLOW",
-		"PAGE_FAULT_CMD",
-		"PAGE_FAULT_SURF_DST",
-		"PAGE_FAULT_SURF_SRC",
-		"PAGE_FAULT_TEXTURE",
-		"PAGE_FAULT_FLAT",
-		"PAGE_FAULT_TRANSLATION",
-		"PAGE_FAULT_COLORMAP",
-		"PAGE_FAULT_TRANMAP",
-	};
-	uint32_t flags_read, flags_cleared = 0;
-	int i;
+static void harddoom2_enqueue_cmd(struct harddoom2_device *hdev, struct harddoom2_cmd_buf *buf) {
+	// find free slot
+	uint32_t bytes_pos = hdev->cmd_write_idx * sizeof(*buf);
+	uint32_t page_idx = bytes_pos / HARDDOOM2_PAGE_SIZE + 1; // +1 because of page table
+	uint32_t page_offset = bytes_pos % HARDDOOM2_PAGE_SIZE;
 
-	__atomic_exchange(&harddoom2_intr_error_flags, &flags_cleared, &flags_read, __ATOMIC_SEQ_CST);
+	// TODO wait for free space (!!!) [we're in sync though, who sends so many cmds?]
 
-	for (i = 0; i < HARDDOOM2_INTR_ERRORS_CNT; i++) {
-		if (flags_read & HARDDOOM2_INTR_ERROR(i)) {
-			dev_err(&pddata->pdev->dev, "Error: %s\n", errors[i]);
-		}
-	}
-}
+	// add to queue, assumption: mutex to queue is locked
+	memcpy(hdev->cmd_queue->pages[page_idx].phys_addr + page_offset, buf, sizeof(*buf));
+	hdev->cmd_write_idx = (hdev->cmd_write_idx + 1) % HARDDOOM2_MAX_CMD_CNT;
 
-static inline void harddoom2_send_cmd(struct harddoom2_pcidevdata *pddata, struct harddoom2_cmd_buf *buf) {
-	int i;
-
-	for (i = 0; i < HARDDOOM2_CMD_SEND_SIZE; i++) {
-		iowrite32(buf->w[i], pddata->bar0 + HARDDOOM2_CMD_SEND(i)); // happily assuming there's space (todo fix)
-	}
+	// note: you need to update write idx yourself
 }
 
 static ssize_t doomdev2_write(struct file *filep, const char __user *user_buff, size_t count, loff_t *offp) {
@@ -848,7 +856,7 @@ static ssize_t doomdev2_write(struct file *filep, const char __user *user_buff, 
 		return 0;
 	}
 
-	ret = mutex_lock_interruptible(&ctx->pddata->sync_queue_mutex);
+	ret = mutex_lock_interruptible(&ctx->hdev->sync_queue_mutex);
 	if (ret) {
 		return ret;
 	}
@@ -860,8 +868,8 @@ static ssize_t doomdev2_write(struct file *filep, const char __user *user_buff, 
 	}
 
 #define HARDDOOM2_SETUP_HELPER(buf_name, buf_flag, buf_w_idx, append_code) do { \
-		if (ctx->active_bufs.buf_name && ctx->active_bufs.buf_name != ctx->pddata->last_active_bufs.buf_name) { \
-			ctx->pddata->last_active_bufs.buf_name = ctx->active_bufs.buf_name; \
+		if (ctx->active_bufs.buf_name && ctx->active_bufs.buf_name != ctx->hdev->last_active_bufs.buf_name) { \
+			ctx->hdev->last_active_bufs.buf_name = ctx->active_bufs.buf_name; \
 			flags |= (buf_flag); \
 			cmd_buf.w[(buf_w_idx)] = ctx->active_bufs.buf_name->pages[0].dma_handle >> HARDDOOM2_CMD_SETUP_PT_SHIFT; \
 			append_code; \
@@ -883,7 +891,7 @@ static ssize_t doomdev2_write(struct file *filep, const char __user *user_buff, 
 	cmd_buf.w[0] = HARDDOOM2_CMD_W0_SETUP(HARDDOOM2_CMD_TYPE_SETUP, flags, sdwidth, sswidth);
 #undef HARDDOOM2_SETUP_HELPER
 
-	harddoom2_send_cmd(ctx->pddata, &cmd_buf);
+	harddoom2_enqueue_cmd(ctx->hdev, &cmd_buf);
 
 	// process command by command
 	ret = 0;
@@ -899,13 +907,13 @@ static ssize_t doomdev2_write(struct file *filep, const char __user *user_buff, 
 
 		err = doomdev2_prepare_harddoom2_cmd(ctx, &cmd_buf, &dev_cmd);
 		if (err) {
-			dev_info(&ctx->pddata->pdev->dev, "Got invalid command, cmd_type = 0x%x\n", dev_cmd.type); // todo remove
+			dev_info(&ctx->hdev->pdev->dev, "Got invalid command, cmd_type = 0x%x\n", dev_cmd.type); // todo remove
 			if (ret == 0) {
 				ret = err;
 			}
 			break;
 		}
-		harddoom2_send_cmd(ctx->pddata, &cmd_buf);
+		harddoom2_enqueue_cmd(ctx->hdev, &cmd_buf);
 		ret += sizeof(dev_cmd);
 	}
 
@@ -916,16 +924,20 @@ static ssize_t doomdev2_write(struct file *filep, const char __user *user_buff, 
 	// wait until commands are processed
 	memset(&cmd_buf, 0, sizeof(cmd_buf));
 	cmd_buf.w[0] = HARDDOOM2_CMD_W0_SETUP(HARDDOOM2_CMD_TYPE_SETUP,
-		HARDDOOM2_CMD_FLAG_INTERLOCK | HARDDOOM2_CMD_FLAG_PING_SYNC, 0, 0);
-	harddoom2_send_cmd(ctx->pddata, &cmd_buf);
+		HARDDOOM2_CMD_FLAG_INTERLOCK | HARDDOOM2_CMD_FLAG_PING_SYNC, 0, 0); // todo change to fence in async code
+	harddoom2_enqueue_cmd(ctx->hdev, &cmd_buf);
 
-	// todo some kind of sleep?
-	harddoom2_handle_intr_errors(ctx->pddata); // todo move later (in sync code we won't print it since we won't receive PONG_SYNC after error)
+	if (ret > 0) {
+		iowrite32(ctx->hdev->cmd_write_idx, ctx->hdev->bar0 + HARDDOOM2_CMD_WRITE_IDX);
+	}
+	else {
+		printk(KERN_DEBUG "Some error occured, ret=%ld\n", ret); // todo remove (?)
+	}
 
-	wait_for_completion(&ctx->pddata->pong_sync);
+	wait_for_completion(&ctx->hdev->pong_sync);
 
 exit_op:
-	mutex_unlock(&ctx->pddata->sync_queue_mutex);
+	mutex_unlock(&ctx->hdev->sync_queue_mutex);
 
 	return ret;
 }
@@ -966,10 +978,11 @@ static void doomdev2_dealloc_minor(dev_t minor) {
 static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id) {
 	int ret = 0;
 	int minor_zero_based;
+	bool region_request_succeeded = false;
 	dev_t minor;
 	uint32_t code_it, code_size;
 	void __iomem *bar0;
-	struct harddoom2_pcidevdata *pddata;
+	struct harddoom2_device *hdev;
 	struct device *sysfs_dev;
 
 	// enable device, map memory
@@ -982,49 +995,60 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 	ret = pci_request_regions(pdev, harddoom2_driver.name);
 	if (ret) {
 		dev_err(&pdev->dev, "Cannot request PCI regions: %d", ret);
-		goto err_0;
+		goto err_disable_pci_device;
 	}
+	region_request_succeeded = true;
 
 	bar0 = pci_iomap(pdev, 0, 0);
 	if (!bar0) {
 		dev_err(&pdev->dev, "Failed: pci_iomap");
 		ret = -ENOMEM;
-		goto err_0;
+		goto err_disable_pci_device;
 	}
 
 	// alloc drvdata
-	pddata = (struct harddoom2_pcidevdata*) kmalloc(sizeof(struct harddoom2_pcidevdata), GFP_KERNEL);
-	if (!pddata) {
+	hdev = (struct harddoom2_device*) kmalloc(sizeof(struct harddoom2_device), GFP_KERNEL);
+	if (!hdev) {
 		dev_err(&pdev->dev, "Failed: kmalloc for driver data");
 		ret = -ENOMEM;
-		goto err_1;
+		goto err_unmap_pci_io;
 	}
-	pddata->pdev = pdev;
-	pddata->bar0 = bar0;
-	pddata->cmd_queue = NULL; // TODO (!!!)
-	memset(&pddata->last_active_bufs, 0, sizeof(pddata->last_active_bufs));
-	mutex_init(&pddata->sync_queue_mutex);
-	init_completion(&pddata->pong_sync);
-	pci_set_drvdata(pdev, pddata);
+	hdev->pdev = pdev;
+	hdev->bar0 = bar0;
+	hdev->cmd_queue = NULL; // init below
+	hdev->cmd_write_idx = hdev->cmd_read_idx_cached = 0;
+	memset(&hdev->last_active_bufs, 0, sizeof(hdev->last_active_bufs));
+	mutex_init(&hdev->sync_queue_mutex);
+	init_completion(&hdev->pong_sync);
+	pci_set_drvdata(pdev, hdev);
 
 	// set up dma
 	pci_set_master(pdev);
 	ret = pci_set_dma_mask(pdev, HARDDOOM2_DMA_MASK);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to set PCI DMA mask");
-		goto err_2;
+		goto err_pci_clear_master;
 	}
 	ret = pci_set_consistent_dma_mask(pdev, HARDDOOM2_DMA_MASK);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to set consistent PCI DMA mask");
-		goto err_2;
+		goto err_pci_clear_master;
 	}
 
+	// allocate cmd queue buffer
+	hdev->cmd_queue = doomdev2_dma_buffer_alloc(hdev, DOOMDEV2_MAX_BUFFER_SIZE / HARDDOOM2_PAGE_SIZE + 1); // +1 for page table
+	if (!hdev->cmd_queue) {
+		dev_err(&pdev->dev, "Failed: allocation of dma buffer for command queue");
+		ret = -ENOMEM;
+		goto err_pci_clear_master;
+	}
+	doomdev2_dma_buffer_format_page_table(hdev->cmd_queue, false);
+
 	// register interruption handler
-	ret = request_irq(pdev->irq, harddoom2_irq_handler, IRQF_SHARED, harddoom2_name, pddata);
+	ret = request_irq(pdev->irq, harddoom2_irq_handler, IRQF_SHARED, harddoom2_name, hdev);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed: request_irq");
-		goto err_2;
+		goto err_del_cmd_queue;
 	}
 
 	// boot sequence
@@ -1034,76 +1058,86 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 		iowrite32(doomcode2[code_it], bar0 + HARDDOOM2_FE_CODE_WINDOW);
 	}
 	iowrite32(HARDDOOM2_RESET_ALL, bar0 + HARDDOOM2_RESET);
-	// todo init CMD_PT, CMD_SIZE and CMD_*_IDX,
+	iowrite32(hdev->cmd_queue->pages[0].dma_handle >> HARDDOOM2_CMD_SETUP_PT_SHIFT, bar0 + HARDDOOM2_CMD_PT);
+	iowrite32(HARDDOOM2_MAX_CMD_CNT, bar0 + HARDDOOM2_CMD_SIZE);
+	iowrite32(hdev->cmd_read_idx_cached, bar0 + HARDDOOM2_CMD_READ_IDX);
+	iowrite32(hdev->cmd_write_idx, bar0 + HARDDOOM2_CMD_WRITE_IDX);
 	iowrite32(HARDDOOM2_INTR_MASK, bar0 + HARDDOOM2_INTR);
 	iowrite32(HARDDOOM2_INTR_MASK, bar0 + HARDDOOM2_INTR_ENABLE);
 	// todo init FENCE_COUNTER
-	iowrite32(HARDDOOM2_ENABLE_ALL & ~HARDDOOM2_ENABLE_CMD_FETCH, bar0 + HARDDOOM2_ENABLE);
+	iowrite32(HARDDOOM2_ENABLE_ALL, bar0 + HARDDOOM2_ENABLE);
 
 	// prepare chrdev (after booting device)
-	cdev_init(&pddata->doomdev2, &doomdev2_fops);
+	cdev_init(&hdev->doomdev2, &doomdev2_fops);
 	minor = doomdev2_alloc_minor();
 	minor_zero_based = minor - doomdev2_major;
 	if (minor == DOOMDEV2_NO_AVAILABLE_MINOR) {
 		dev_err(&pdev->dev, "Failed: no available minor to register new device");
 		ret = -ENOSPC;
-		goto err_3;
+		goto err_disable_harddom2;
 	}
-	ret = cdev_add(&pddata->doomdev2, minor, 1);
+	ret = cdev_add(&hdev->doomdev2, minor, 1);
 	if (ret) {
 		dev_err(&pdev->dev, "Failed to add cdev, minor %d", minor_zero_based);
-		goto err_4;
+		goto err_dealloc_doomdev2_minor;
 	}
 	sysfs_dev = device_create(&doomdev2_class, &pdev->dev, minor, NULL, "doom%d", minor_zero_based);
 	if (IS_ERR(sysfs_dev)) {
 		dev_err(&pdev->dev, "Failed to create sysfs device, minor %d", minor_zero_based);
 		ret = PTR_ERR(sysfs_dev);
-		goto err_5;
+		goto err_del_cdev;
 	}
 
 	return ret;
 
-err_5:
-	cdev_del(&pddata->doomdev2);
-err_4:
+err_del_cdev:
+	cdev_del(&hdev->doomdev2);
+err_dealloc_doomdev2_minor:
 	doomdev2_dealloc_minor(minor);
-err_3:
-	iowrite32(0, pddata->bar0 + HARDDOOM2_ENABLE);
-	iowrite32(0, pddata->bar0 + HARDDOOM2_INTR_ENABLE);
-	ioread32(pddata->bar0 + HARDDOOM2_ENABLE);
-	free_irq(pdev->irq, pddata);
-err_2:
+err_disable_harddom2:
+	iowrite32(0, hdev->bar0 + HARDDOOM2_ENABLE);
+	iowrite32(0, hdev->bar0 + HARDDOOM2_INTR_ENABLE);
+	ioread32(hdev->bar0 + HARDDOOM2_ENABLE);
+	free_irq(pdev->irq, hdev);
+err_del_cmd_queue:
+	doomdev2_dma_buffer_del(hdev->cmd_queue);
+err_pci_clear_master:
 	pci_clear_master(pdev);
-	kfree(pddata);
-err_1:
+	kfree(hdev);
+err_unmap_pci_io:
 	pci_iounmap(pdev, bar0);
-err_0:
+err_disable_pci_device:
 	pci_disable_device(pdev);
-	pci_release_regions(pdev); // should be called after pci_disable_device()
+	if (region_request_succeeded) {
+		pci_release_regions(pdev); // should be called after pci_disable_device()
+	}
 
 	return ret;
 }
 
 static void harddoom2_remove(struct pci_dev *pdev) {
-	struct harddoom2_pcidevdata *pddata = (struct harddoom2_pcidevdata*) pci_get_drvdata(pdev);
+	struct harddoom2_device *hdev = (struct harddoom2_device*) pci_get_drvdata(pdev);
 
 	// "unboot" device
-	iowrite32(0, pddata->bar0 + HARDDOOM2_ENABLE);
-	iowrite32(0, pddata->bar0 + HARDDOOM2_INTR_ENABLE);
-	ioread32(pddata->bar0 + HARDDOOM2_ENABLE);
-	free_irq(pddata->pdev->irq, pddata);
+	iowrite32(0, hdev->bar0 + HARDDOOM2_ENABLE);
+	iowrite32(0, hdev->bar0 + HARDDOOM2_INTR_ENABLE);
+	ioread32(hdev->bar0 + HARDDOOM2_ENABLE);
+	free_irq(hdev->pdev->irq, hdev);
 
 	// destroy chrdev
-	device_destroy(&doomdev2_class, pddata->doomdev2.dev);
-	cdev_del(&pddata->doomdev2); // mwk said "we don't have to care about opened fd"
-	doomdev2_dealloc_minor(pddata->doomdev2.dev);
+	device_destroy(&doomdev2_class, hdev->doomdev2.dev);
+	cdev_del(&hdev->doomdev2);
+	doomdev2_dealloc_minor(hdev->doomdev2.dev);
+
+	// dealloc cmd queue
+	doomdev2_dma_buffer_del(hdev->cmd_queue);
 
 	// release pci device
 	pci_clear_master(pdev);
-	pci_iounmap(pdev, pddata->bar0);
+	pci_iounmap(pdev, hdev->bar0);
 	pci_disable_device(pdev);
 	pci_release_regions(pdev); // should be called after pci_disable_device()
-	kfree(pddata);
+	kfree(hdev);
 }
 
 static const struct pci_device_id harddoom2_pci_tbl[] = {
