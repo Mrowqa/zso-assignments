@@ -1,7 +1,10 @@
 // TODO remove unused headers
 // TODO check last year's scoring
 // TODO fix "--[tab]"
-// TODO suspend (sync_queue_mutex + ping_sync) // rename: remove "sync_"
+// TODO sync_queue_mutex -> queue_mutex
+// TODO async :X
+// TODO test suspend after making code async
+// TODO readme note: suspend, needs to unmount p9
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/ioctl.h>
@@ -76,6 +79,7 @@ struct harddoom2_device {
 	struct pci_dev *pdev;
 	void __iomem *bar0;
 	struct cdev doomdev2;
+	bool ready; // not ready when suspending
 
 	struct doomdev2_dma_buffer *cmd_queue;
 	uint32_t cmd_write_idx;
@@ -83,7 +87,7 @@ struct harddoom2_device {
 	struct completion pong_async;
 
 	struct doomdev2_ctx_buffers last_active_bufs; // note: NEVER deref pointers inside (we hold weak reference here)
-	struct mutex sync_queue_mutex; // used for sending to queue and operating on last_active_bufs member
+	struct mutex sync_queue_mutex; // used for sending to queue and operating on last_active_bufs member (todo more semantics, explain)
 	struct completion pong_sync;
 };
 
@@ -277,6 +281,10 @@ static ssize_t doomdev2_dma_buffer_io(struct file *filep, char __user *buff_read
 	ret = mutex_lock_interruptible(&dma_buf->hdev->sync_queue_mutex);
 	if (ret) {
 		return ret;
+	}
+	if (!dma_buf->hdev->ready) {
+		ret = -EAGAIN;
+		goto exit_op;
 	}
 
 	ret = 0;
@@ -879,6 +887,10 @@ static ssize_t doomdev2_write(struct file *filep, const char __user *user_buff, 
 	if (ret) {
 		return ret;
 	}
+	if (!ctx->hdev->ready) {
+		ret = -EAGAIN;
+		goto exit_op;
+	}
 
 	// context switch
 	ret = mutex_lock_interruptible(&ctx->active_bufs_mutex);
@@ -942,19 +954,19 @@ static ssize_t doomdev2_write(struct file *filep, const char __user *user_buff, 
 	// todo (optimization) -- make a copy, and remember about ref counts!
 	mutex_unlock(&ctx->active_bufs_mutex);
 
-	// wait until commands are processed
-	memset(&cmd_buf, 0, sizeof(cmd_buf));
-	cmd_buf.w[0] = HARDDOOM2_CMD_W0_SETUP(HARDDOOM2_CMD_TYPE_SETUP, HARDDOOM2_CMD_FLAG_PING_SYNC, 0, 0); // todo change to fence in async code
-	harddoom2_enqueue_cmd(ctx->hdev, &cmd_buf);
 
 	if (ret > 0) {
+		// wait until commands are processed
+		memset(&cmd_buf, 0, sizeof(cmd_buf));
+		cmd_buf.w[0] = HARDDOOM2_CMD_W0_SETUP(HARDDOOM2_CMD_TYPE_SETUP, HARDDOOM2_CMD_FLAG_PING_SYNC, 0, 0); // todo change to fence in async code
+		harddoom2_enqueue_cmd(ctx->hdev, &cmd_buf);
 		iowrite32(ctx->hdev->cmd_write_idx, ctx->hdev->bar0 + HARDDOOM2_CMD_WRITE_IDX);
+		wait_for_completion(&ctx->hdev->pong_sync);
 	}
 	else {
 		printk(KERN_DEBUG "Some error occured, ret=%ld\n", ret); // todo remove (?)
 	}
 
-	wait_for_completion(&ctx->hdev->pong_sync);
 
 exit_op:
 	mutex_unlock(&ctx->hdev->sync_queue_mutex);
@@ -995,12 +1007,45 @@ static void doomdev2_dealloc_minor(dev_t minor) {
 }
 
 
+static void harddoom2_enable(struct harddoom2_device *hdev) {
+	uint32_t code_size, it;
+
+	// assertions
+	BUG_ON(hdev->cmd_write_idx != 0 || hdev->cmd_read_idx_cached != 0);
+	for (it = 0; it < sizeof(hdev->last_active_bufs); it++) {
+		if (((uint8_t*) &hdev->last_active_bufs)[it]) {
+			BUG();
+		}
+	}
+
+	// boot sequence
+	iowrite32(0, hdev->bar0 + HARDDOOM2_FE_CODE_ADDR);
+	code_size = ARRAY_SIZE(doomcode2);
+	for (it = 0; it < code_size; it++) {
+		iowrite32(doomcode2[it], hdev->bar0 + HARDDOOM2_FE_CODE_WINDOW);
+	}
+	iowrite32(HARDDOOM2_RESET_ALL, hdev->bar0 + HARDDOOM2_RESET);
+	iowrite32(hdev->cmd_queue->pages[0].dma_handle >> HARDDOOM2_CMD_SETUP_PT_SHIFT, hdev->bar0 + HARDDOOM2_CMD_PT);
+	iowrite32(HARDDOOM2_MAX_CMD_CNT, hdev->bar0 + HARDDOOM2_CMD_SIZE);
+	iowrite32(hdev->cmd_read_idx_cached, hdev->bar0 + HARDDOOM2_CMD_READ_IDX);
+	iowrite32(hdev->cmd_write_idx, hdev->bar0 + HARDDOOM2_CMD_WRITE_IDX);
+	iowrite32(HARDDOOM2_INTR_MASK, hdev->bar0 + HARDDOOM2_INTR);
+	iowrite32(HARDDOOM2_INTR_MASK & ~HARDDOOM2_INTR_PONG_ASYNC, hdev->bar0 + HARDDOOM2_INTR_ENABLE);
+	// todo init FENCE_COUNTER
+	iowrite32(HARDDOOM2_ENABLE_ALL, hdev->bar0 + HARDDOOM2_ENABLE);
+}
+
+static void harddoom2_disable(struct harddoom2_device *hdev) {
+	iowrite32(0, hdev->bar0 + HARDDOOM2_ENABLE);
+	iowrite32(0, hdev->bar0 + HARDDOOM2_INTR_ENABLE);
+	ioread32(hdev->bar0 + HARDDOOM2_ENABLE);
+}
+
 static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id) {
 	int ret = 0;
 	int minor_zero_based;
 	bool region_request_succeeded = false;
 	dev_t minor;
-	uint32_t code_it, code_size;
 	void __iomem *bar0;
 	struct harddoom2_device *hdev;
 	struct device *sysfs_dev;
@@ -1035,6 +1080,7 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 	}
 	hdev->pdev = pdev;
 	hdev->bar0 = bar0;
+	hdev->ready = true;
 	hdev->cmd_queue = NULL; // init below
 	hdev->cmd_write_idx = hdev->cmd_read_idx_cached = 0;
 	init_completion(&hdev->pong_async);
@@ -1073,20 +1119,7 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 	}
 
 	// boot sequence
-	iowrite32(0, bar0 + HARDDOOM2_FE_CODE_ADDR);
-	code_size = ARRAY_SIZE(doomcode2);
-	for (code_it = 0; code_it < code_size; code_it++) {
-		iowrite32(doomcode2[code_it], bar0 + HARDDOOM2_FE_CODE_WINDOW);
-	}
-	iowrite32(HARDDOOM2_RESET_ALL, bar0 + HARDDOOM2_RESET);
-	iowrite32(hdev->cmd_queue->pages[0].dma_handle >> HARDDOOM2_CMD_SETUP_PT_SHIFT, bar0 + HARDDOOM2_CMD_PT);
-	iowrite32(HARDDOOM2_MAX_CMD_CNT, bar0 + HARDDOOM2_CMD_SIZE);
-	iowrite32(hdev->cmd_read_idx_cached, bar0 + HARDDOOM2_CMD_READ_IDX);
-	iowrite32(hdev->cmd_write_idx, bar0 + HARDDOOM2_CMD_WRITE_IDX);
-	iowrite32(HARDDOOM2_INTR_MASK, bar0 + HARDDOOM2_INTR);
-	iowrite32(HARDDOOM2_INTR_MASK & ~HARDDOOM2_INTR_PONG_ASYNC, bar0 + HARDDOOM2_INTR_ENABLE);
-	// todo init FENCE_COUNTER
-	iowrite32(HARDDOOM2_ENABLE_ALL, bar0 + HARDDOOM2_ENABLE);
+	harddoom2_enable(hdev);
 
 	// prepare chrdev (after booting device)
 	cdev_init(&hdev->doomdev2, &doomdev2_fops);
@@ -1116,9 +1149,7 @@ err_del_cdev:
 err_dealloc_doomdev2_minor:
 	doomdev2_dealloc_minor(minor);
 err_disable_harddom2:
-	iowrite32(0, hdev->bar0 + HARDDOOM2_ENABLE);
-	iowrite32(0, hdev->bar0 + HARDDOOM2_INTR_ENABLE);
-	ioread32(hdev->bar0 + HARDDOOM2_ENABLE);
+	harddoom2_disable(hdev);
 	free_irq(pdev->irq, hdev);
 err_del_cmd_queue:
 	doomdev2_dma_buffer_del(hdev->cmd_queue);
@@ -1140,9 +1171,7 @@ static void harddoom2_remove(struct pci_dev *pdev) {
 	struct harddoom2_device *hdev = (struct harddoom2_device*) pci_get_drvdata(pdev);
 
 	// "unboot" device
-	iowrite32(0, hdev->bar0 + HARDDOOM2_ENABLE);
-	iowrite32(0, hdev->bar0 + HARDDOOM2_INTR_ENABLE);
-	ioread32(hdev->bar0 + HARDDOOM2_ENABLE);
+	harddoom2_disable(hdev);
 	free_irq(hdev->pdev->irq, hdev);
 
 	// destroy chrdev
@@ -1161,6 +1190,61 @@ static void harddoom2_remove(struct pci_dev *pdev) {
 	kfree(hdev);
 }
 
+static int harddoom2_suspend(struct pci_dev *dev, pm_message_t state) {
+	struct harddoom2_device *hdev = (struct harddoom2_device*) pci_get_drvdata(dev);
+	struct harddoom2_cmd_buf cmd_buf;
+	int ret = 0;
+
+	if (state.event != PM_EVENT_SUSPEND) {
+		dev_warn(&dev->dev, "Warning: suspending, got state 0x%x, expected 0x%x", state.event, PM_EVENT_SUSPEND);
+	}
+
+	// don't allow to put more commands
+	ret = mutex_lock_interruptible(&hdev->sync_queue_mutex);
+	if (ret) {
+		return ret;
+	}
+	BUG_ON(!hdev->ready);
+
+	// wait until all commands are executed
+	memset(&cmd_buf, 0, sizeof(cmd_buf));
+	cmd_buf.w[0] = HARDDOOM2_CMD_W0_SETUP(HARDDOOM2_CMD_TYPE_SETUP, HARDDOOM2_CMD_FLAG_PING_SYNC, 0, 0);
+	harddoom2_enqueue_cmd(hdev, &cmd_buf);
+	iowrite32(hdev->cmd_write_idx, hdev->bar0 + HARDDOOM2_CMD_WRITE_IDX);
+	wait_for_completion(&hdev->pong_sync);
+
+	// mark flag device not available (todo handle it in other places!)
+	hdev->ready = false;
+
+	// "save" device state
+	hdev->cmd_write_idx = hdev->cmd_read_idx_cached = 0;
+	memset(&hdev->last_active_bufs, 0, sizeof(hdev->last_active_bufs));
+
+	harddoom2_disable(hdev);
+
+	mutex_unlock(&hdev->sync_queue_mutex);
+
+	return ret;
+}
+
+static int harddoom2_resume(struct pci_dev *dev) {
+	struct harddoom2_device *hdev = (struct harddoom2_device*) pci_get_drvdata(dev);
+	int ret = 0;
+
+	ret = mutex_lock_interruptible(&hdev->sync_queue_mutex); // should it be interruptable?
+	if (ret) {
+		return ret;
+	}
+	BUG_ON(hdev->ready);
+
+	hdev->ready = true;
+	harddoom2_enable(hdev);
+
+	mutex_unlock(&hdev->sync_queue_mutex);
+
+	return ret;
+}
+
 static const struct pci_device_id harddoom2_pci_tbl[] = {
 	{ PCI_DEVICE(HARDDOOM2_VENDOR_ID, HARDDOOM2_DEVICE_ID) },
 	{ 0, },
@@ -1171,9 +1255,8 @@ static struct pci_driver harddoom2_driver = {
     .id_table = harddoom2_pci_tbl,
 	.probe = harddoom2_probe,
 	.remove = harddoom2_remove,
-    // TODO (!!!)
-    // int  (*suspend) (struct pci_dev *dev, pm_message_t state);
-    // int  (*resume) (struct pci_dev *dev);
+	.suspend = harddoom2_suspend,
+	.resume = harddoom2_resume,
 };
 
 static int harddoom2_init(void) {
