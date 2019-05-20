@@ -2,7 +2,6 @@
 // TODO check last year's scoring
 // TODO fix "--[tab]"
 // TODO sync_queue_mutex -> queue_mutex
-// TODO async :X
 // TODO test suspend after making code async
 // TODO readme note: suspend, needs to unmount p9
 #include <linux/module.h>
@@ -86,6 +85,10 @@ struct harddoom2_device {
 	uint32_t cmd_read_idx_cached;
 	struct completion pong_async;
 
+	uint32_t fence_cnt;
+	struct completion fence;
+	struct mutex fence_wait_mutex;
+
 	struct doomdev2_ctx_buffers last_active_bufs; // note: NEVER deref pointers inside (we hold weak reference here)
 	struct mutex sync_queue_mutex; // used for sending to queue and operating on last_active_bufs member (todo more semantics, explain)
 	struct completion pong_sync;
@@ -109,6 +112,10 @@ struct doomdev2_dma_buffer {
 	int32_t width;
 	int32_t height; // if zero, then it's a buffer, not a surface
 	struct file *file;
+
+	uint32_t last_fence;
+	struct mutex buffer_mutex;
+	bool ready;
 
 	size_t pages_cnt;
 	struct doomdev2_dma_page pages[0];
@@ -147,9 +154,9 @@ static irqreturn_t harddoom2_irq_handler(int _irq, void *dev) {
 	}
 
 	// handle interruptions
-	if (flags & HARDDOOM2_INTR_FENCE) {
-		// todo
-		BUG();
+	if (flags & intr_enabled & HARDDOOM2_INTR_FENCE) {
+		iowrite32(HARDDOOM2_INTR_FENCE, hdev->bar0 + HARDDOOM2_INTR);
+		complete(&hdev->fence);
 	}
 
 	if (flags & HARDDOOM2_INTR_PONG_SYNC) {
@@ -192,6 +199,9 @@ static struct doomdev2_dma_buffer *doomdev2_dma_buffer_alloc(struct harddoom2_de
 	dma_buf->width = DOOMDEV2_DMA_BUFFER_NO_VALUE;   // set later in other function
 	dma_buf->height = DOOMDEV2_DMA_BUFFER_NO_VALUE;  // ^
 	dma_buf->file = NULL;
+	dma_buf->last_fence = 0;
+	mutex_init(&dma_buf->buffer_mutex);
+	dma_buf->ready = true;
 	dma_buf->pages_cnt = pages_cnt;
 
 	// alloc pages
@@ -269,30 +279,120 @@ err_out:
 	return ret;
 }
 
+static int doomdev2_dma_buffer_fence_wait(struct doomdev2_dma_buffer *dma_buf) {
+	// assumption: both dma_buf and hdev mutexes are locked
+	uint32_t dev_fence_cnt, wait_pos, cur_pos;
+	uint32_t intr_flags;
+	int ret = 0;
+
+	ret = mutex_lock_interruptible(&dma_buf->hdev->fence_wait_mutex);
+	if (ret) {
+		return ret;
+	}
+
+	// we could fail to disable it last time
+	intr_flags = ioread32(dma_buf->hdev->bar0 + HARDDOOM2_INTR_ENABLE);
+	iowrite32(intr_flags & ~HARDDOOM2_INTR_FENCE, dma_buf->hdev->bar0 + HARDDOOM2_INTR_ENABLE);
+
+	// mwk said we should clear fence before writing fence wait
+	iowrite32(HARDDOOM2_INTR_FENCE, dma_buf->hdev->bar0 + HARDDOOM2_INTR);
+	iowrite32(dma_buf->last_fence, dma_buf->hdev->bar0 + HARDDOOM2_FENCE_WAIT);
+	// we need to clear the fence completion (with fence interruption disabled),
+	// since it could be completed a couple of times last time
+	reinit_completion(&dma_buf->hdev->fence);
+	// clear the interruption again to prevent races: after that we either will get single interruption,
+	// or we already reached the limit
+	iowrite32(HARDDOOM2_INTR_FENCE, dma_buf->hdev->bar0 + HARDDOOM2_INTR);
+	dev_fence_cnt = ioread32(dma_buf->hdev->bar0 + HARDDOOM2_FENCE_COUNTER);
+
+	// cyclic shift, (fence_cnt - fence_cnt - 1) == -1 (as uint32_t), so latest scheduled command has greatest number
+	cur_pos = dev_fence_cnt - dma_buf->hdev->fence_cnt - 1;
+	wait_pos = dma_buf->last_fence - dma_buf->hdev->fence_cnt - 1;
+
+	if (cur_pos < wait_pos) {
+		// do the thing, i mean just wait
+		iowrite32(intr_flags | HARDDOOM2_INTR_FENCE, dma_buf->hdev->bar0 + HARDDOOM2_INTR_ENABLE);
+		mutex_unlock(&dma_buf->buffer_mutex);
+		mutex_unlock(&dma_buf->hdev->sync_queue_mutex);
+
+		wait_for_completion(&dma_buf->hdev->fence);
+
+		// note: queue must be locked before buffer to avoid deadlock
+		// note: we have to lock this mutex, to disable interruption
+		ret = mutex_lock_interruptible(&dma_buf->hdev->sync_queue_mutex);
+		if (ret) {
+			goto err_exit;
+		}
+		
+		// disable interruption, if not ready, then device will be resumed later with proper flags, anyway
+		// if we failed to lock the mutex, we will disable the interruption next time, anyway
+		if (dma_buf->hdev->ready) {
+			intr_flags = ioread32(dma_buf->hdev->bar0 + HARDDOOM2_INTR_ENABLE);
+			iowrite32(intr_flags & ~HARDDOOM2_INTR_FENCE, dma_buf->hdev->bar0 + HARDDOOM2_INTR_ENABLE);
+		}
+
+		ret = mutex_lock_interruptible(&dma_buf->buffer_mutex);
+		if (ret) {
+			goto err_exit;
+		}
+	}
+
+ err_exit:
+	mutex_unlock(&dma_buf->hdev->fence_wait_mutex);
+
+	return ret;
+}
 
 static ssize_t doomdev2_dma_buffer_io(struct file *filep, char __user *buff_read, const char __user *buff_write,
 		size_t count, loff_t *offp) {
 	struct doomdev2_dma_buffer *dma_buf = (struct doomdev2_dma_buffer*) filep->private_data;
 	loff_t buf_size = DOOMDEV2_DMA_BUFFER_SIZE(dma_buf);
 	ssize_t ret;
+	// if user wants to write a buffer, or read a surface buffer
+	const bool fence_wait_required = buff_write || dma_buf->height > 0;
 
 	BUG_ON((buff_read && buff_write) || (!buff_read && !buff_write));
 
-	ret = mutex_lock_interruptible(&dma_buf->hdev->sync_queue_mutex);
-	if (ret) {
-		return ret;
-	}
-	if (!dma_buf->hdev->ready) {
-		ret = -EAGAIN;
-		goto exit_op;
-	}
-
-	ret = 0;
-
 	if (*offp < 0) {
-		ret = -EINVAL;
-		goto exit_op;
+		return -EINVAL;
 	}
+
+	if (fence_wait_required) {
+		// lock the device - we want to talk to it
+		// note: it MUST be locked before the buffer, to avoid deadlock in command preparation method
+		ret = mutex_lock_interruptible(&dma_buf->hdev->sync_queue_mutex);
+		if (ret) {
+			return ret;
+		}
+		if (!dma_buf->hdev->ready) {
+			ret = -EAGAIN;
+			goto err_unlock_queue;
+		}
+	}
+
+	ret = mutex_lock_interruptible(&dma_buf->buffer_mutex);
+	if (ret) {
+		goto err_unlock_queue;
+	}
+	if (!dma_buf->ready) {
+		ret = -EAGAIN;
+		goto err_unlock_queue_and_buffer;
+	}
+
+	// if needed, wait for all preceding operations to complete
+	if (fence_wait_required) {
+		dma_buf->ready = false;
+		ret = doomdev2_dma_buffer_fence_wait(dma_buf);
+		dma_buf->ready = true; // correct even if buffer mutex is not locked, and we have to unlock the buffer anyway
+		if (ret) {
+			goto err_unlock_queue_and_buffer;
+		}
+
+		mutex_unlock(&dma_buf->hdev->sync_queue_mutex);
+	}
+
+	// copy data
+	ret = 0;
 
 	while (*offp < buf_size && ret < count) {
 		ssize_t to_copy = min(
@@ -323,7 +423,19 @@ static ssize_t doomdev2_dma_buffer_io(struct file *filep, char __user *buff_read
 	}
 
 exit_op:
-	mutex_unlock(&dma_buf->hdev->sync_queue_mutex);
+	mutex_unlock(&dma_buf->buffer_mutex);
+
+	return ret;
+
+	// fence wait could not manage to regain the mutexes
+err_unlock_queue_and_buffer:
+	if (mutex_is_locked(&dma_buf->buffer_mutex)) {
+		mutex_unlock(&dma_buf->buffer_mutex);
+	}
+err_unlock_queue:
+	if (mutex_is_locked(&dma_buf->hdev->sync_queue_mutex)) {
+		mutex_unlock(&dma_buf->hdev->sync_queue_mutex);
+	}
 
 	return ret;
 }
@@ -643,10 +755,20 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 	uint16_t texture_limit;
 	uint16_t fuzz_start, fuzz_end;
 	uint8_t fuzz_pos;
+	struct doomdev2_dma_buffer *used_buffers[DOOMDEV2_CTX_BUFFERS_CNT];
+	struct doomdev2_dma_buffer **next_buf_it = used_buffers, **it1, **it2, **end;
+	int ret = 0;
 
+	BUG_ON(!mutex_is_locked(&ctx->active_bufs_mutex)); // todo comment out
+
+	memset(used_buffers, 0, sizeof(used_buffers));
 	memset(buf_cmd, 0, sizeof(*buf_cmd));
 
 #define HARDDOOM2_ENSURE(cond) if (!(cond)) { printk(KERN_DEBUG "ensure failed at %d\n", __LINE__); return -EINVAL; } // todo remove printk
+#define HARDDOOM2_USE_BUFFER(buf) do { \
+		HARDDOOM2_ENSURE((buf)); \
+		*next_buf_it++ = (buf); \
+	} while (0)
 
 	switch (dev_cmd->type) {
 	case DOOMDEV2_CMD_TYPE_COPY_RECT:
@@ -658,7 +780,8 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 		height = dev_cmd->copy_rect.height;
 		flags = HARDDOOM2_CMD_FLAG_INTERLOCK;
 
-		HARDDOOM2_ENSURE(bufs->surf_dst && bufs->surf_src);
+		HARDDOOM2_USE_BUFFER(bufs->surf_dst);
+		HARDDOOM2_USE_BUFFER(bufs->surf_src);
 		HARDDOOM2_ENSURE(x_a + width - 1 < bufs->surf_dst->width
 			&& y_a + height - 1 < bufs->surf_dst->height
 			&& x_b + width - 1 < bufs->surf_src->width
@@ -682,7 +805,7 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 		width = dev_cmd->fill_rect.width;
 		height = dev_cmd->fill_rect.height;
 
-		HARDDOOM2_ENSURE(bufs->surf_dst);
+		HARDDOOM2_USE_BUFFER(bufs->surf_dst);
 		HARDDOOM2_ENSURE(x_a + width - 1 < bufs->surf_dst->width
 			&& y_a + height - 1 < bufs->surf_dst->height);
 
@@ -697,8 +820,8 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 		x_b = dev_cmd->draw_line.pos_b_x;
 		y_b = dev_cmd->draw_line.pos_b_y;
 
-		HARDDOOM2_ENSURE(bufs->surf_dst
-			&& x_a < bufs->surf_dst->width && y_a < bufs->surf_dst->height
+		HARDDOOM2_USE_BUFFER(bufs->surf_dst);
+		HARDDOOM2_ENSURE(x_a < bufs->surf_dst->width && y_a < bufs->surf_dst->height
 			&& x_b < bufs->surf_dst->width && y_b < bufs->surf_dst->height);
 
 		buf_cmd->w[0] = HARDDOOM2_CMD_TYPE_DRAW_LINE;
@@ -714,7 +837,8 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 		height = dev_cmd->draw_background.height;
 		flat_idx = dev_cmd->draw_background.flat_idx;
 
-		HARDDOOM2_ENSURE(bufs->surf_dst && bufs->flat);
+		HARDDOOM2_USE_BUFFER(bufs->surf_dst);
+		HARDDOOM2_USE_BUFFER(bufs->flat);
 		HARDDOOM2_ENSURE(x_a + width - 1 < bufs->surf_dst->width
 			&& y_a + height - 1 < bufs->surf_dst->height);
 		HARDDOOM2_ENSURE(flat_idx * DOOMDEV2_BUFFER_FLAT_SIZE < bufs->flat->width);
@@ -731,7 +855,8 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 		flags = 0;
 		translation_idx = colormap_idx = 0;
 
-		HARDDOOM2_ENSURE(bufs->surf_dst && bufs->texture);
+		HARDDOOM2_USE_BUFFER(bufs->surf_dst);
+		HARDDOOM2_USE_BUFFER(bufs->texture);
 		HARDDOOM2_ENSURE(x_a < bufs->surf_dst->width
 			&& y_a <= y_b && y_b < bufs->surf_dst->height);
 
@@ -741,18 +866,18 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 		if (dev_cmd->draw_column.flags & DOOMDEV2_CMD_FLAGS_TRANSLATE) {
 			flags |= HARDDOOM2_CMD_FLAG_TRANSLATION;
 			translation_idx = dev_cmd->draw_column.translation_idx;
-			HARDDOOM2_ENSURE(bufs->translation
-				&& translation_idx * DOOMDEV2_BUFFER_COLORMAP_SIZE < bufs->translation->width);
+			HARDDOOM2_USE_BUFFER(bufs->translation);
+			HARDDOOM2_ENSURE(translation_idx * DOOMDEV2_BUFFER_COLORMAP_SIZE < bufs->translation->width);
 		}
 		if (dev_cmd->draw_column.flags & DOOMDEV2_CMD_FLAGS_COLORMAP) {
 			flags |= HARDDOOM2_CMD_FLAG_COLORMAP;
 			colormap_idx = dev_cmd->draw_column.colormap_idx;
-			HARDDOOM2_ENSURE(bufs->colormap
-				&& colormap_idx * DOOMDEV2_BUFFER_COLORMAP_SIZE < bufs->colormap->width);
+			HARDDOOM2_USE_BUFFER(bufs->colormap);
+			HARDDOOM2_ENSURE(colormap_idx * DOOMDEV2_BUFFER_COLORMAP_SIZE < bufs->colormap->width);
 		}
 		if (dev_cmd->draw_column.flags & DOOMDEV2_CMD_FLAGS_TRANMAP) {
 			flags |= HARDDOOM2_CMD_FLAG_TRANMAP;
-			HARDDOOM2_ENSURE(bufs->tranmap);
+			HARDDOOM2_USE_BUFFER(bufs->tranmap);
 		}
 
 		buf_cmd->w[0] = DOOMDEV2_CMD_TYPE_DRAW_COLUMN | flags;
@@ -773,7 +898,8 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 		flags = 0;
 		translation_idx = colormap_idx = 0;
 
-		HARDDOOM2_ENSURE(bufs->surf_dst && bufs->flat);
+		HARDDOOM2_USE_BUFFER(bufs->surf_dst);
+		HARDDOOM2_USE_BUFFER(bufs->flat);
 		HARDDOOM2_ENSURE(x_a <= x_b && x_b < bufs->surf_dst->width
 			&& y_a < bufs->surf_dst->height);
 		HARDDOOM2_ENSURE(flat_idx * DOOMDEV2_BUFFER_FLAT_SIZE < bufs->flat->width);
@@ -781,18 +907,18 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 		if (dev_cmd->draw_span.flags & DOOMDEV2_CMD_FLAGS_TRANSLATE) {
 			flags |= HARDDOOM2_CMD_FLAG_TRANSLATION;
 			translation_idx = dev_cmd->draw_span.translation_idx;
-			HARDDOOM2_ENSURE(bufs->translation
-				&& translation_idx * DOOMDEV2_BUFFER_COLORMAP_SIZE < bufs->translation->width);
+			HARDDOOM2_USE_BUFFER(bufs->translation);
+			HARDDOOM2_ENSURE(translation_idx * DOOMDEV2_BUFFER_COLORMAP_SIZE < bufs->translation->width);
 		}
 		if (dev_cmd->draw_span.flags & DOOMDEV2_CMD_FLAGS_COLORMAP) {
 			flags |= HARDDOOM2_CMD_FLAG_COLORMAP;
 			colormap_idx = dev_cmd->draw_span.colormap_idx;
-			HARDDOOM2_ENSURE(bufs->colormap
-				&& colormap_idx * DOOMDEV2_BUFFER_COLORMAP_SIZE < bufs->colormap->width);
+			HARDDOOM2_USE_BUFFER(bufs->colormap);
+			HARDDOOM2_ENSURE(colormap_idx * DOOMDEV2_BUFFER_COLORMAP_SIZE < bufs->colormap->width);
 		}
 		if (dev_cmd->draw_span.flags & DOOMDEV2_CMD_FLAGS_TRANMAP) {
 			flags |= HARDDOOM2_CMD_FLAG_TRANMAP;
-			HARDDOOM2_ENSURE(bufs->tranmap);
+			HARDDOOM2_USE_BUFFER(bufs->tranmap);
 		}
 
 		buf_cmd->w[0] = HARDDOOM2_CMD_TYPE_DRAW_SPAN | flags;
@@ -815,7 +941,8 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 		fuzz_pos = dev_cmd->draw_fuzz.fuzz_pos;
 		flags = HARDDOOM2_CMD_FLAG_COLORMAP;
 
-		HARDDOOM2_ENSURE(bufs->surf_dst && bufs->colormap);
+		HARDDOOM2_USE_BUFFER(bufs->surf_dst);
+		HARDDOOM2_USE_BUFFER(bufs->colormap);
 		HARDDOOM2_ENSURE(x_a < bufs->surf_dst->width
 			&& fuzz_start <= y_a && y_a <= y_b && y_b <= fuzz_end && fuzz_end < bufs->surf_dst->height);
 		HARDDOOM2_ENSURE(fuzz_pos <= HARDDOOM2_FUZZ_POS_MAX);
@@ -829,9 +956,52 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 		break;
 	}
 
+#undef HARDDOOM2_USE_BUFFER
 #undef HARDDOOM2_ENSURE
 
-	return 0;
+	// eliminate duplicates
+	end = next_buf_it;
+	for (it1 = used_buffers; it1 < end; it1++) {
+		for (it2 = used_buffers; it2 < it1; it2++) {
+			if (*it1 == *it2) {
+				*it1 = NULL;
+			}
+		}
+	}
+
+	// lock every buffer
+	for (it1 = used_buffers; it1 < end; it1++) {
+		if (*it1) {
+			ret = mutex_lock_interruptible(&(*it1)->buffer_mutex);
+			if (ret) {
+				it1--; // we failed to lock this buffer
+				goto err_unlock_mutexes;
+			}
+			if (!(*it1)->ready) {
+				ret = -EAGAIN;
+				goto err_unlock_mutexes;
+			}
+		}
+	}
+
+	// update last fence & release buffer
+	for (it1 = used_buffers; it1 < end; it1++) {
+		if (*it1) {
+			(*it1)->last_fence = ctx->hdev->fence_cnt + 1; // +1, since write() updates it at the end of method
+			mutex_unlock(&(*it1)->buffer_mutex);
+		}
+	}
+
+	return ret;
+
+err_unlock_mutexes:
+	for ( ; it1 >= used_buffers; it1--) {
+		if (*it1) {
+			mutex_unlock(&(*it1)->buffer_mutex);
+		}
+	}
+
+	return ret;
 }
 
 static void harddoom2_enqueue_cmd(struct harddoom2_device *hdev, struct harddoom2_cmd_buf *buf) {
@@ -840,13 +1010,19 @@ static void harddoom2_enqueue_cmd(struct harddoom2_device *hdev, struct harddoom
 	uint32_t page_idx = bytes_pos / HARDDOOM2_PAGE_SIZE + 1; // +1 because of page table
 	uint32_t page_offset = bytes_pos % HARDDOOM2_PAGE_SIZE;
 	uint32_t next_write_idx = (hdev->cmd_write_idx + 1) % HARDDOOM2_MAX_CMD_CNT;
+	uint32_t intr_flags;
+
+	// assumption: mutex to queue is locked
+	BUG_ON(!mutex_is_locked(&hdev->sync_queue_mutex)); // todo comment out
 
 	// wait for space in queue, if there's none
 	if (next_write_idx == hdev->cmd_read_idx_cached) {
 		iowrite32(HARDDOOM2_INTR_PONG_ASYNC, hdev->bar0 + HARDDOOM2_INTR);
 		hdev->cmd_read_idx_cached = ioread32(hdev->bar0 + HARDDOOM2_CMD_READ_IDX);
 		if (next_write_idx == hdev->cmd_read_idx_cached) {
-			uint32_t intr_flags = ioread32(hdev->bar0 + HARDDOOM2_INTR_ENABLE);
+			// could be completed a couple of times last time, so we need to reset it before enabling the interruption
+			reinit_completion(&hdev->pong_async);
+			intr_flags = ioread32(hdev->bar0 + HARDDOOM2_INTR_ENABLE);
 			iowrite32(intr_flags | HARDDOOM2_INTR_PONG_ASYNC, hdev->bar0 + HARDDOOM2_INTR_ENABLE);
 			iowrite32(hdev->cmd_write_idx, hdev->bar0 + HARDDOOM2_CMD_WRITE_IDX);
 			wait_for_completion(&hdev->pong_async);
@@ -860,7 +1036,7 @@ static void harddoom2_enqueue_cmd(struct harddoom2_device *hdev, struct harddoom
 		buf->w[0] |= HARDDOOM2_CMD_FLAG_PING_ASYNC;
 	}
 
-	// add to queue, assumption: mutex to queue is locked
+	// add to queue
 	memcpy(hdev->cmd_queue->pages[page_idx].phys_addr + page_offset, buf, sizeof(*buf));
 	hdev->cmd_write_idx = next_write_idx;
 
@@ -954,19 +1130,16 @@ static ssize_t doomdev2_write(struct file *filep, const char __user *user_buff, 
 	// todo (optimization) -- make a copy, and remember about ref counts!
 	mutex_unlock(&ctx->active_bufs_mutex);
 
-
 	if (ret > 0) {
-		// wait until commands are processed
 		memset(&cmd_buf, 0, sizeof(cmd_buf));
-		cmd_buf.w[0] = HARDDOOM2_CMD_W0_SETUP(HARDDOOM2_CMD_TYPE_SETUP, HARDDOOM2_CMD_FLAG_PING_SYNC, 0, 0); // todo change to fence in async code
+		cmd_buf.w[0] = HARDDOOM2_CMD_W0_SETUP(HARDDOOM2_CMD_TYPE_SETUP, HARDDOOM2_CMD_FLAG_FENCE, 0, 0);
 		harddoom2_enqueue_cmd(ctx->hdev, &cmd_buf);
 		iowrite32(ctx->hdev->cmd_write_idx, ctx->hdev->bar0 + HARDDOOM2_CMD_WRITE_IDX);
-		wait_for_completion(&ctx->hdev->pong_sync);
+		ctx->hdev->fence_cnt++;
 	}
 	else {
 		printk(KERN_DEBUG "Some error occured, ret=%ld\n", ret); // todo remove (?)
 	}
-
 
 exit_op:
 	mutex_unlock(&ctx->hdev->sync_queue_mutex);
@@ -983,7 +1156,6 @@ static struct file_operations doomdev2_fops = {
 	.llseek = no_llseek,
 	.write = doomdev2_write,
 };
-
 
 static dev_t doomdev2_alloc_minor(void) {
 	dev_t ret = DOOMDEV2_NO_AVAILABLE_MINOR;
@@ -1006,12 +1178,12 @@ static void doomdev2_dealloc_minor(dev_t minor) {
 	mutex_unlock(&doomdev2_used_minors_mutex);
 }
 
-
 static void harddoom2_enable(struct harddoom2_device *hdev) {
 	uint32_t code_size, it;
 
 	// assertions
 	BUG_ON(hdev->cmd_write_idx != 0 || hdev->cmd_read_idx_cached != 0);
+	BUG_ON(hdev->fence_cnt != 0);
 	for (it = 0; it < sizeof(hdev->last_active_bufs); it++) {
 		if (((uint8_t*) &hdev->last_active_bufs)[it]) {
 			BUG();
@@ -1030,8 +1202,8 @@ static void harddoom2_enable(struct harddoom2_device *hdev) {
 	iowrite32(hdev->cmd_read_idx_cached, hdev->bar0 + HARDDOOM2_CMD_READ_IDX);
 	iowrite32(hdev->cmd_write_idx, hdev->bar0 + HARDDOOM2_CMD_WRITE_IDX);
 	iowrite32(HARDDOOM2_INTR_MASK, hdev->bar0 + HARDDOOM2_INTR);
-	iowrite32(HARDDOOM2_INTR_MASK & ~HARDDOOM2_INTR_PONG_ASYNC, hdev->bar0 + HARDDOOM2_INTR_ENABLE);
-	// todo init FENCE_COUNTER
+	iowrite32(HARDDOOM2_INTR_MASK & ~HARDDOOM2_INTR_PONG_ASYNC & ~HARDDOOM2_INTR_FENCE, hdev->bar0 + HARDDOOM2_INTR_ENABLE);
+	iowrite32(hdev->fence_cnt, hdev->bar0 + HARDDOOM2_FENCE_COUNTER);
 	iowrite32(HARDDOOM2_ENABLE_ALL, hdev->bar0 + HARDDOOM2_ENABLE);
 }
 
@@ -1084,6 +1256,11 @@ static int harddoom2_probe(struct pci_dev *pdev, const struct pci_device_id *_id
 	hdev->cmd_queue = NULL; // init below
 	hdev->cmd_write_idx = hdev->cmd_read_idx_cached = 0;
 	init_completion(&hdev->pong_async);
+
+	hdev->fence_cnt = 0;
+	init_completion(&hdev->fence);
+	mutex_init(&hdev->fence_wait_mutex);
+
 	memset(&hdev->last_active_bufs, 0, sizeof(hdev->last_active_bufs));
 	mutex_init(&hdev->sync_queue_mutex);
 	init_completion(&hdev->pong_sync);
@@ -1213,11 +1390,11 @@ static int harddoom2_suspend(struct pci_dev *dev, pm_message_t state) {
 	iowrite32(hdev->cmd_write_idx, hdev->bar0 + HARDDOOM2_CMD_WRITE_IDX);
 	wait_for_completion(&hdev->pong_sync);
 
-	// mark flag device not available (todo handle it in other places!)
 	hdev->ready = false;
 
 	// "save" device state
 	hdev->cmd_write_idx = hdev->cmd_read_idx_cached = 0;
+	hdev->fence_cnt = 0;
 	memset(&hdev->last_active_bufs, 0, sizeof(hdev->last_active_bufs));
 
 	harddoom2_disable(hdev);
