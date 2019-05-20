@@ -1,20 +1,7 @@
-// TODO remove unused headers
-// TODO check last year's scoring
-// TODO fix "--[tab]"
-// TODO sync_queue_mutex -> queue_mutex
-// TODO async :X
-// TODO test suspend after making code async
-// TODO readme note: suspend, needs to unmount p9
 #include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/ioctl.h>
-#include <linux/device.h>
 #include <linux/uaccess.h>
-#include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/cdev.h>
-#include <linux/cred.h>
-#include <linux/slab.h>
 #include <linux/pci.h>
 #include <linux/anon_inodes.h>
 #include <linux/completion.h>
@@ -79,7 +66,7 @@ struct harddoom2_device {
 	struct pci_dev *pdev;
 	void __iomem *bar0;
 	struct cdev doomdev2;
-	bool ready; // not ready when suspending
+	bool ready; // not ready when suspended
 
 	struct doomdev2_dma_buffer *cmd_queue;
 	uint32_t cmd_write_idx;
@@ -87,7 +74,7 @@ struct harddoom2_device {
 	struct completion pong_async;
 
 	struct doomdev2_ctx_buffers last_active_bufs; // note: NEVER deref pointers inside (we hold weak reference here)
-	struct mutex sync_queue_mutex; // used for sending to queue and operating on last_active_bufs member (todo more semantics, explain)
+	struct mutex sync_queue_mutex; // used for locking whole device and cmd queue
 	struct completion pong_sync;
 };
 
@@ -147,8 +134,7 @@ static irqreturn_t harddoom2_irq_handler(int _irq, void *dev) {
 	}
 
 	// handle interruptions
-	if (flags & HARDDOOM2_INTR_FENCE) {
-		// todo
+	if (flags & intr_enabled & HARDDOOM2_INTR_FENCE) {
 		BUG();
 	}
 
@@ -278,21 +264,17 @@ static ssize_t doomdev2_dma_buffer_io(struct file *filep, char __user *buff_read
 
 	BUG_ON((buff_read && buff_write) || (!buff_read && !buff_write));
 
+	if (*offp < 0) {
+		return -EINVAL;
+	}
+
 	ret = mutex_lock_interruptible(&dma_buf->hdev->sync_queue_mutex);
 	if (ret) {
 		return ret;
 	}
-	if (!dma_buf->hdev->ready) {
-		ret = -EAGAIN;
-		goto exit_op;
-	}
+	// no need to check whether device is ready -> we talk only with system RAM
 
 	ret = 0;
-
-	if (*offp < 0) {
-		ret = -EINVAL;
-		goto exit_op;
-	}
 
 	while (*offp < buf_size && ret < count) {
 		ssize_t to_copy = min(
@@ -375,7 +357,7 @@ err_put_unused_fd:
 }
 
 static void doomdev2_dma_buffer_format_page_table(struct doomdev2_dma_buffer *dma_buf, bool writable) {
-	// todo (optimization) put page table on the last page if possible
+	// might do (optimization) put page table on the last page if possible
 	uint32_t *page_it, *pages_end;
 	struct doomdev2_dma_page *dma_page_it;
 
@@ -646,7 +628,7 @@ static int doomdev2_prepare_harddoom2_cmd(struct doomdev2_ctx *ctx, struct hardd
 
 	memset(buf_cmd, 0, sizeof(*buf_cmd));
 
-#define HARDDOOM2_ENSURE(cond) if (!(cond)) { printk(KERN_DEBUG "ensure failed at %d\n", __LINE__); return -EINVAL; } // todo remove printk
+#define HARDDOOM2_ENSURE(cond) if (!(cond)) { return -EINVAL; }
 
 	switch (dev_cmd->type) {
 	case DOOMDEV2_CMD_TYPE_COPY_RECT:
@@ -840,13 +822,16 @@ static void harddoom2_enqueue_cmd(struct harddoom2_device *hdev, struct harddoom
 	uint32_t page_idx = bytes_pos / HARDDOOM2_PAGE_SIZE + 1; // +1 because of page table
 	uint32_t page_offset = bytes_pos % HARDDOOM2_PAGE_SIZE;
 	uint32_t next_write_idx = (hdev->cmd_write_idx + 1) % HARDDOOM2_MAX_CMD_CNT;
+	uint32_t intr_flags;
 
 	// wait for space in queue, if there's none
 	if (next_write_idx == hdev->cmd_read_idx_cached) {
 		iowrite32(HARDDOOM2_INTR_PONG_ASYNC, hdev->bar0 + HARDDOOM2_INTR);
 		hdev->cmd_read_idx_cached = ioread32(hdev->bar0 + HARDDOOM2_CMD_READ_IDX);
 		if (next_write_idx == hdev->cmd_read_idx_cached) {
-			uint32_t intr_flags = ioread32(hdev->bar0 + HARDDOOM2_INTR_ENABLE);
+			// could be completed a couple of times last time, so we need to reset it before enabling the interruption
+			reinit_completion(&hdev->pong_async);
+			intr_flags = ioread32(hdev->bar0 + HARDDOOM2_INTR_ENABLE);
 			iowrite32(intr_flags | HARDDOOM2_INTR_PONG_ASYNC, hdev->bar0 + HARDDOOM2_INTR_ENABLE);
 			iowrite32(hdev->cmd_write_idx, hdev->bar0 + HARDDOOM2_CMD_WRITE_IDX);
 			wait_for_completion(&hdev->pong_async);
@@ -868,7 +853,7 @@ static void harddoom2_enqueue_cmd(struct harddoom2_device *hdev, struct harddoom
 }
 
 static ssize_t doomdev2_write(struct file *filep, const char __user *user_buff, size_t count, loff_t *offp) {
-	// todo (optimization) preprocess commands, then lock the mutex, change context, and send commands
+	// might do (optimization) preprocess commands, then lock the mutex, change context, and send commands
 	struct doomdev2_ctx *ctx = (struct doomdev2_ctx*) filep->private_data;
 	struct harddoom2_cmd_buf cmd_buf;
 	struct doomdev2_cmd dev_cmd;
@@ -940,7 +925,6 @@ static ssize_t doomdev2_write(struct file *filep, const char __user *user_buff, 
 
 		err = doomdev2_prepare_harddoom2_cmd(ctx, &cmd_buf, &dev_cmd);
 		if (err) {
-			dev_info(&ctx->hdev->pdev->dev, "Got invalid command, cmd_type = 0x%x\n", dev_cmd.type); // todo remove
 			if (ret == 0) {
 				ret = err;
 			}
@@ -950,23 +934,19 @@ static ssize_t doomdev2_write(struct file *filep, const char __user *user_buff, 
 		ret += sizeof(dev_cmd);
 	}
 
-	// we need to access active buffers while validating commands
-	// todo (optimization) -- make a copy, and remember about ref counts!
-	mutex_unlock(&ctx->active_bufs_mutex);
-
-
 	if (ret > 0) {
 		// wait until commands are processed
 		memset(&cmd_buf, 0, sizeof(cmd_buf));
-		cmd_buf.w[0] = HARDDOOM2_CMD_W0_SETUP(HARDDOOM2_CMD_TYPE_SETUP, HARDDOOM2_CMD_FLAG_PING_SYNC, 0, 0); // todo change to fence in async code
+		cmd_buf.w[0] = HARDDOOM2_CMD_W0_SETUP(HARDDOOM2_CMD_TYPE_SETUP, HARDDOOM2_CMD_FLAG_PING_SYNC, 0, 0);
 		harddoom2_enqueue_cmd(ctx->hdev, &cmd_buf);
 		iowrite32(ctx->hdev->cmd_write_idx, ctx->hdev->bar0 + HARDDOOM2_CMD_WRITE_IDX);
 		wait_for_completion(&ctx->hdev->pong_sync);
 	}
-	else {
-		printk(KERN_DEBUG "Some error occured, ret=%ld\n", ret); // todo remove (?)
-	}
 
+	// we need to
+	// (1) access active buffers while validating commands
+	// (2) make sure the buffers won't get deallocated before all commands are processed
+	mutex_unlock(&ctx->active_bufs_mutex);
 
 exit_op:
 	mutex_unlock(&ctx->hdev->sync_queue_mutex);
@@ -1030,8 +1010,7 @@ static void harddoom2_enable(struct harddoom2_device *hdev) {
 	iowrite32(hdev->cmd_read_idx_cached, hdev->bar0 + HARDDOOM2_CMD_READ_IDX);
 	iowrite32(hdev->cmd_write_idx, hdev->bar0 + HARDDOOM2_CMD_WRITE_IDX);
 	iowrite32(HARDDOOM2_INTR_MASK, hdev->bar0 + HARDDOOM2_INTR);
-	iowrite32(HARDDOOM2_INTR_MASK & ~HARDDOOM2_INTR_PONG_ASYNC, hdev->bar0 + HARDDOOM2_INTR_ENABLE);
-	// todo init FENCE_COUNTER
+	iowrite32(HARDDOOM2_INTR_MASK & ~HARDDOOM2_INTR_PONG_ASYNC & ~HARDDOOM2_INTR_FENCE, hdev->bar0 + HARDDOOM2_INTR_ENABLE);
 	iowrite32(HARDDOOM2_ENABLE_ALL, hdev->bar0 + HARDDOOM2_ENABLE);
 }
 
@@ -1213,7 +1192,7 @@ static int harddoom2_suspend(struct pci_dev *dev, pm_message_t state) {
 	iowrite32(hdev->cmd_write_idx, hdev->bar0 + HARDDOOM2_CMD_WRITE_IDX);
 	wait_for_completion(&hdev->pong_sync);
 
-	// mark flag device not available (todo handle it in other places!)
+	// mark flag device not available
 	hdev->ready = false;
 
 	// "save" device state
