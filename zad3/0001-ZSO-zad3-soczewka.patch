@@ -1,0 +1,260 @@
+From d1d340e91e939bc9e15a5dc34093f450b056f62d Mon Sep 17 00:00:00 2001
+From: Artur Jamro <artur.jamro@gmail.com>
+Date: Sun, 9 Jun 2019 09:23:37 +0000
+Subject: [PATCH] ZSO zad3: soczewka
+
+---
+ include/linux/moduleparam.h     | 15 +++++++
+ include/linux/sched.h           |  2 +
+ include/linux/soczewka.h        |  7 ++++
+ include/linux/uaccess.h         | 11 +++++-
+ include/uapi/linux/capability.h |  5 ++-
+ init/init_task.c                |  1 +
+ kernel/Makefile                 |  3 +-
+ kernel/fork.c                   |  2 +
+ kernel/soczewka.c               | 87 +++++++++++++++++++++++++++++++++++++++++
+ 9 files changed, 129 insertions(+), 4 deletions(-)
+ create mode 100644 include/linux/soczewka.h
+ create mode 100644 kernel/soczewka.c
+
+diff --git a/include/linux/moduleparam.h b/include/linux/moduleparam.h
+index ba36506..8f6d8e5 100644
+--- a/include/linux/moduleparam.h
++++ b/include/linux/moduleparam.h
+@@ -446,6 +446,21 @@ extern int param_set_bint(const char *val, const struct kernel_param *kp);
+ 			    perm, -1, 0);				\
+ 	__MODULE_PARM_TYPE(name, "array of " #type)
+ 
++#define core_param_array(name, type, nump, perm)		\
++	core_param_array_named(name, name, type, nump, perm)
++
++#define core_param_array_named(name, array, type, nump, perm)		\
++	param_check_##type(name, &(array)[0]);				\
++	static const struct kparam_array __param_arr_##name		\
++	= { .max = ARRAY_SIZE(array), .num = nump,                      \
++	    .ops = &param_ops_##type,					\
++	    .elemsize = sizeof(array[0]), .elem = array };		\
++	__module_param_call("", name,			\
++			    &param_array_ops,				\
++			    .arr = &__param_arr_##name,			\
++			    perm, -1, 0);				\
++	__MODULE_PARM_TYPE(name, "array of " #type)
++
+ enum hwparam_type {
+ 	hwparam_ioport,		/* Module parameter configures an I/O port */
+ 	hwparam_iomem,		/* Module parameter configures an I/O mem address */
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 291a9bd..91bb03a 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1205,6 +1205,8 @@ struct task_struct {
+ 	unsigned long			lowest_stack;
+ 	unsigned long			prev_lowest_stack;
+ #endif
++	/* There are max 64 sinful words */
++	atomic64_t			soczewka_bitmap;
+ 
+ 	/*
+ 	 * New fields for task_struct should be added above here, so that
+diff --git a/include/linux/soczewka.h b/include/linux/soczewka.h
+new file mode 100644
+index 0000000..73c0fc5
+--- /dev/null
++++ b/include/linux/soczewka.h
+@@ -0,0 +1,7 @@
++#ifndef _LINUX_SOCZEWKA_H
++#define _LINUX_SOCZEWKA_H
++
++void soczewka_scan(const void *data, unsigned long bytes);
++
++#endif /* _LINUX_SOCZEWKA_H */
++
+diff --git a/include/linux/uaccess.h b/include/linux/uaccess.h
+index efe79c1..d326768 100644
+--- a/include/linux/uaccess.h
++++ b/include/linux/uaccess.h
+@@ -5,6 +5,7 @@
+ #include <linux/sched.h>
+ #include <linux/thread_info.h>
+ #include <linux/kasan-checks.h>
++#include <linux/soczewka.h>
+ 
+ #define VERIFY_READ 0
+ #define VERIFY_WRITE 1
+@@ -143,16 +144,22 @@ _copy_to_user(void __user *, const void *, unsigned long);
+ static __always_inline unsigned long __must_check
+ copy_from_user(void *to, const void __user *from, unsigned long n)
+ {
+-	if (likely(check_copy_size(to, n, false)))
++	unsigned long start_n = n;
++	if (likely(check_copy_size(to, n, false))) {
+ 		n = _copy_from_user(to, from, n);
++		soczewka_scan(to, start_n - n);
++	}
+ 	return n;
+ }
+ 
+ static __always_inline unsigned long __must_check
+ copy_to_user(void __user *to, const void *from, unsigned long n)
+ {
+-	if (likely(check_copy_size(from, n, true)))
++	unsigned long start_n = n;
++	if (likely(check_copy_size(from, n, true))) {
+ 		n = _copy_to_user(to, from, n);
++		soczewka_scan(from, start_n - n);
++	}
+ 	return n;
+ }
+ #ifdef CONFIG_COMPAT
+diff --git a/include/uapi/linux/capability.h b/include/uapi/linux/capability.h
+index 240fdb9..ca704c1 100644
+--- a/include/uapi/linux/capability.h
++++ b/include/uapi/linux/capability.h
+@@ -366,8 +366,11 @@ struct vfs_ns_cap_data {
+ 
+ #define CAP_AUDIT_READ		37
+ 
++/* Only for the sneakiest of the trickiest processes who knows how to sin */
++#define CAP_SYS_SOCZEWKA_IMMUNE 38
+ 
+-#define CAP_LAST_CAP         CAP_AUDIT_READ
++
++#define CAP_LAST_CAP         CAP_SYS_SOCZEWKA_IMMUNE
+ 
+ #define cap_valid(x) ((x) >= 0 && (x) <= CAP_LAST_CAP)
+ 
+diff --git a/init/init_task.c b/init/init_task.c
+index 5aebe3b..3485329 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -179,6 +179,7 @@ struct task_struct init_task
+ #ifdef CONFIG_SECURITY
+ 	.security	= NULL,
+ #endif
++	.soczewka_bitmap	= ATOMIC64_INIT(0),
+ };
+ EXPORT_SYMBOL(init_task);
+ 
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 7343b3a..aa133b1 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -10,7 +10,8 @@ obj-y     = fork.o exec_domain.o panic.o \
+ 	    extable.o params.o \
+ 	    kthread.o sys_ni.o nsproxy.o \
+ 	    notifier.o ksysfs.o cred.o reboot.o \
+-	    async.o range.o smpboot.o ucount.o
++	    async.o range.o smpboot.o ucount.o \
++	    soczewka.o
+ 
+ obj-$(CONFIG_MODULES) += kmod.o
+ obj-$(CONFIG_MULTIUSER) += groups.o
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 906cd0c..84fd640 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1758,6 +1758,8 @@ static __latent_entropy struct task_struct *copy_process(
+ 	if (!p)
+ 		goto fork_out;
+ 
++	atomic64_set(&p->soczewka_bitmap, 0);
++
+ 	/*
+ 	 * This _must_ happen before we call free_task(), i.e. before we jump
+ 	 * to any of the bad_fork_* labels. This is to avoid freeing
+diff --git a/kernel/soczewka.c b/kernel/soczewka.c
+new file mode 100644
+index 0000000..4accd6e
+--- /dev/null
++++ b/kernel/soczewka.c
+@@ -0,0 +1,87 @@
++/* Next generation tool for keeping students machine "secure" */
++
++#include <linux/moduleparam.h>
++#include <linux/sched.h>
++#include <linux/cred.h>
++#include <linux/capability.h>
++#include <asm/spinlock.h>
++#include <linux/atomic.h>
++
++#define MAX_WORDS		64
++#define MAX_MSG_SIZE	2048
++#define BYTES_MARGIN	256
++
++static int soczewka_cnt = 0;
++static char* soczewka[MAX_WORDS] = { 0 };
++static char msg_buf[MAX_MSG_SIZE] = { 0 };
++static DEFINE_SPINLOCK(msg_buf_lock);
++
++core_param_array(soczewka, charp, &soczewka_cnt, 0);
++
++void soczewka_scan(const void *data, unsigned long bytes) {
++	int word_idx;
++	unsigned long flags;
++	int64_t soczewka_mask;
++	int64_t word_mask;
++	const char *word_pos;
++	struct task_struct *task = current;
++
++	if (soczewka_cnt == 0 ||
++			has_capability(task, CAP_SYS_SOCZEWKA_IMMUNE)) {
++		return;
++	}
++
++	soczewka_mask = atomic64_read(&task->soczewka_bitmap);
++
++	for (word_idx = 0; word_idx < soczewka_cnt; word_idx++) {
++		if (!soczewka[word_idx]) {
++			continue;
++		}
++
++		word_mask = 1 << word_idx;
++		if (soczewka_mask & word_mask) {
++			continue;
++		}
++		
++		if ((word_pos = strnstr(data, soczewka[word_idx], bytes))) {
++			soczewka_mask = atomic64_fetch_or(word_mask, &task->soczewka_bitmap);
++			if (!(soczewka_mask & word_mask)) {
++				size_t buf_pos = 0;
++				const char *it, *it_end;
++				/* atomic64_fetch_or modifies the bitmap in task struct */
++				soczewka_mask |= word_mask;
++
++				spin_lock_irqsave(&msg_buf_lock, flags);
++				buf_pos = snprintf(msg_buf, MAX_MSG_SIZE,
++					"soczewka: PID %d UID %d GID %d %s before [",
++					task_pid_nr(task), task_uid(task).val, task_cred_xxx(task, gid).val,
++					soczewka[word_idx]);
++
++				/* before bytes */
++				for (it = max(word_pos - BYTES_MARGIN, (const char*)data); it < word_pos; it++) {
++					buf_pos += snprintf(msg_buf + buf_pos, MAX_MSG_SIZE - buf_pos,
++						"%02x ", (uint8_t) *it);
++				}
++				if (msg_buf[buf_pos - 1] == ' ') { /* remove trailing space if any */
++					buf_pos--;
++				}
++
++				/* after bytes */
++				buf_pos += snprintf(msg_buf + buf_pos, MAX_MSG_SIZE - buf_pos, "] after [");
++				it = word_pos + strlen(soczewka[word_idx]);
++				it_end = min(it + BYTES_MARGIN, (const char*) data + bytes);
++				for (; it < it_end; it++) {
++					buf_pos += snprintf(msg_buf + buf_pos, MAX_MSG_SIZE - buf_pos,
++						"%02x ", (uint8_t) *it);
++				}
++				if (msg_buf[buf_pos - 1] == ' ') { /* remove trailing space if any */
++					buf_pos--;
++				}
++
++				buf_pos += snprintf(msg_buf + buf_pos, MAX_MSG_SIZE - buf_pos, "]");
++				printk(KERN_INFO "%s", msg_buf);
++				spin_unlock_irqrestore(&msg_buf_lock, flags);
++			}
++		}
++	}
++}
+-- 
+2.11.0
+
